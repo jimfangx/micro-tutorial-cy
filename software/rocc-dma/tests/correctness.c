@@ -3,20 +3,31 @@
 #include "commands.h"
 /* 2 MiB exceeds the configured 32 KiB L1D and 512 KiB L2. */
 #define CAP (2 * 1024 * 1024 + 8192)
-static unsigned char src[CAP] __attribute__((aligned(4096)));
-static unsigned char dst[CAP] __attribute__((aligned(4096)));
+static uint64_t src_words[CAP/8] __attribute__((aligned(4096)));
+static uint64_t dst_words[CAP/8] __attribute__((aligned(4096)));
+#define src ((unsigned char *)src_words)
+#define dst ((unsigned char *)dst_words)
 static unsigned char pattern(size_t i, unsigned seed) { return (unsigned char)((i * 37) ^ (i >> 8) ^ seed); }
+static uint64_t word_pattern(size_t i, unsigned seed) {
+    return UINT64_C(0x0102030405060708) ^ (i * UINT64_C(0x9e3779b97f4a7c15)) ^ seed;
+}
 static int run(size_t offset, size_t n, unsigned seed) {
     /* Small cases stay dirty/cached; big cases exercise cache capacity. */
     size_t lo = offset - 8, hi = offset + n + 8;
-    for (size_t i = lo; i < hi; i++) { src[i] = pattern(i, seed); dst[i] = 0xa5; }
+    /* Compare all 64 bits of every aligned unit, including the 8-byte guards.
+       This retains full byte coverage without millions of byte-loop steps. */
+    for (size_t i = lo/8; i < hi/8; i++) {
+        src_words[i] = word_pattern(i, seed);
+        dst_words[i] = UINT64_C(0xa5a5a5a5a5a5a5a5);
+    }
     dma_fence();
     if (dma_config(src + offset, dst + offset) || dma_copy_command(n)) return 1;
     dma_fence();
-    for (size_t i = lo; i < hi; i++) {
-        unsigned char want = (i >= offset && i < offset + n) ? pattern(i, seed) : 0xa5;
-        if (dst[i] != want || src[i] != pattern(i, seed)) {
-            printf("mismatch n=%lu i=%lu got=%u want=%u\n", n, i, dst[i], want); return 2;
+    for (size_t i = lo/8; i < hi/8; i++) {
+        uint64_t want = (i >= offset/8 && i < (offset+n)/8) ?
+            word_pattern(i, seed) : UINT64_C(0xa5a5a5a5a5a5a5a5);
+        if (dst_words[i] != want || src_words[i] != word_pattern(i, seed)) {
+            printf("mismatch n=%lu word=%lu got=%lx want=%lx\n", n, i, dst_words[i], want); return 2;
         }
     }
     return 0;
@@ -35,6 +46,7 @@ int main(void) {
     for (unsigned i=0; i<sizeof(sizes)/sizeof(sizes[0]); i++) {
         if (run(4096-8, sizes[i], i+1)) return 3;
         printf("DMA correctness bytes=%lu PASS\n", sizes[i]);
+        fflush(stdout);
     }
     for (unsigned i=0; i<32; i++) if (run(64, 192, i+31)) return 4;
     for (unsigned i=0; i<256; i++) { src[i]=pattern(i,9); dst[i]=0xa5; }

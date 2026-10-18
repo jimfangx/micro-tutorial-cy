@@ -30,4 +30,5 @@ project/project/
 .classpath_cache/
 .vscode/
 tests/build/
+/test_run_dir/
 conda-reqs/chipyard-base.yaml.bak
