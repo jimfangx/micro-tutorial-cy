@@ -19,11 +19,11 @@ runtime:
   memory: 24g
   pids_limit: 2048
   ray_address: null  # null starts a local CHIA/Ray scheduler
-  ray_cpus: 12
+  ray_cpus: 28
   generation_slots: 2
   build_slots: 1
-  simulation_slots: 4
-  task_timeout_seconds: 7200
+  simulation_slots: 24
+  task_timeout_seconds: 14400
   cache_gb: 4
   environment:
     JAVA_TOOL_OPTIONS: -XX:ActiveProcessorCount=8 -Xmx8G -Xss8M -Djava.io.tmpdir=/tmp -Duser.home=/home/ray
@@ -31,7 +31,7 @@ runtime:
 agent:
   backend: antigravity  # antigravity | claude | codex
   model: null           # null uses the provider's configured default
-  timeout_seconds: 180
+  timeout_seconds: 600
   retries: 1
   authenticate_before_run: true
   # Every proposal gets a PRIVATE copy of credentials/session files. No agent
@@ -108,7 +108,8 @@ software:
   random_seed: 42
   plusargs: {"+cycle-count": "", "+loadmem": "/test.elf"}
   timeout_cycles: 1000000000
-  timeout_seconds: 600
+  # Full 2 MiB coherence verification takes about 80 minutes on this host.
+  timeout_seconds: 10800
 fitness:
   embench_weight: 1.0
   microbench_weight: 1.0

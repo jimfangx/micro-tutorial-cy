@@ -42,7 +42,7 @@ def ensure_image(cfg):
 
 
 @contextlib.contextmanager
-def container(cfg, mounts, *, agent=False, run_id="preflight"):
+def container(cfg, mounts, *, agent=False, run_id="preflight", build=False):
     from chia.cluster.config import DockerConfig
     from chia.cluster.docker import DockerManager
     name = 'chia-dma-' + uuid.uuid4().hex
@@ -61,7 +61,9 @@ def container(cfg, mounts, *, agent=False, run_id="preflight"):
                   (cfg['chia'], '/opt/chia', 'ro')]
         from .config import digest
         token = digest([cfg['storage'], run_id])[:24]
-        affinity = sorted(os.sched_getaffinity(0))[:cfg['runtime']['cpus_per_build']]
+        affinity = sorted(os.sched_getaffinity(0))
+        if build:
+            affinity = affinity[:cfg['runtime']['cpus_per_build']]
         options = ['--label=chia.dma.run=' + token, '--cpuset-cpus=' + ','.join(map(str, affinity)), '--cpus=' + str(cfg['runtime']['cpus_per_build']), '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
                    '--pids-limit=' + str(cfg['runtime']['pids_limit']), '--init', f'--memory={cfg["runtime"]["memory"]}',
                    '--tmpfs /tmp:rw,exec,mode=1777', '--tmpfs /home/ray:rw,exec,mode=1777',
@@ -101,7 +103,7 @@ def run_worker(cfg, action, request, mounts, *, agent=False):
         output.mkdir()
         write_json(request_file, request)
         with container(cfg, [*mounts, (str(request_file), '/request.json', 'ro'),
-                             (str(output), '/output', 'rw')], agent=agent, run_id=request.get('run_id', 'preflight')) as manager:
+                             (str(output), '/output', 'rw')], agent=agent, run_id=request.get('run_id', 'preflight'), build=action in ('build', 'software')) as manager:
             python = str(Path(cfg['runtime']['conda']) / 'bin/python')
             try:
                 result = manager.exec_command(shlex.join([python, '-m', 'chia_dma.worker', action]),

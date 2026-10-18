@@ -32,10 +32,53 @@ Upstream references:
 
 ## Validation evidence
 
-- Ten contract/container tests passed (`experiments/tests.log`).
-- Actual Antigravity worker authentication passed (`experiments/doctor.log`).
-- The unchanged software flow built/froze 19 full-suite Embench binaries per
-  CPU/DMA mode plus five standalone test binaries (43 ELF artifacts), with source
-  hashes checked before and after compilation (`experiments/validation/software`).
-- Fresh RTL build and full-suite runtime validation are being run under
-  `experiments/validation3`; completion is not yet claimed.
+- All 13 contract/container tests passed (`experiments/tests.log`), including
+  native island migration, MAP-Elites persistence, invalid-result exclusion,
+  historical forks, backend switching, cache callbacks, and Docker permissions.
+- All three CHIA CLI backends authenticated inside real task containers and
+  produced allowlisted edits. Two Antigravity proposals completed concurrently
+  in `experiments/generation-fast`. Codex's companion code-mode host is mounted
+  alongside its executable. Partial provider timeouts are rejected rather than
+  being mistaken for completed proposals; the default generation budget is ten
+  minutes.
+- The existing software flow built and froze 43 ELF artifacts: 19 Embench
+  programs per CPU/DMA mode and five standalone tests. No original software,
+  benchmark, or accelerator source was modified by the loop.
+- `experiments/live-validation` passed the fresh SoC build, DMAControllerSpec,
+  all 43 seed workloads, passive metrics validation, and all 19 CPU/DMA output
+  comparisons. This includes the full 2 MiB correctness/coherence test. The
+  measured seed fitness is 1.0.
+- Public historical fork/replay in `experiments/replay-validation` passed all
+  24 workloads after a fresh independent build. Every DMA Embench cycle,
+  activity/output record and microbenchmark sample matched the baseline;
+  replay fitness is exactly 1.0 (`replay-proof.json`). No LLM call generated
+  the replayed RTL, and the original checkpoint remained unchanged.
+- `experiments/invalid-validation` forked the complete two-island population,
+  rejected a real integration-violating source through the CHIA evaluator,
+  preserved both elite maps/global best, and passed public CLI resume. Its
+  SQLite database and writable namespace are independent of the original.
+- The main cluster was stopped and restarted from `00000010-retry` with Codex
+  selected. The completed Antigravity proposal's source/metadata hashes were
+  preserved; only the unfinished generation was retried. The Antigravity design
+  subsequently failed the frozen controller test and was retained with validity
+  0. Codex's proposal passed compilation/controller tests, all 19 DMA Embench
+  programs, the microbenchmarks, and all standalone tests, including full 2 MiB
+  correctness. It was admitted with fitness 1.0. Both islands have two elite
+  cells, and native migration occurred.
+- A final public CLI resume with default Antigravity selected authenticated and
+  preserved the complete native population, tasks, RNG state, iteration count,
+  source hashes, and proposal metadata. All 43 seed workloads, 24 candidate
+  workloads and 24 replay workloads passed. The invalid proposals remain
+  diagnostic records outside the population. The original accelerator sources
+  still match the seed (`live-validation/final-acceptance.json`).
+
+The full correctness test took about 71 minutes on this host. Simulation wall
+limits are three hours and CHIA collection permits four hours. Correctness and
+performance workloads fan out together; every correctness gate must pass before
+admission. The central configuration allows up to 24 simulator tasks. During the
+independent replay/recovery test, the host budget was split between clusters.
+
+Each experiment archives its evaluator code separately from the source seed.
+The existing DMA parser is loaded from that seed. Resume, replay and fork use
+the archived evaluator, so edits in another thread cannot change in-flight
+measurement or search rules.

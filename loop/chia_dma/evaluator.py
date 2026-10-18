@@ -32,7 +32,7 @@ class DMAEvaluator(ChiaEvaluator):
         self.replay = replay
         inventory = read_json(self.run / 'software' / 'manifest.json')['workloads']
         self.correctness = [n for n in cfg['software']['standalone'] if n != 'microbench']
-        workloads = [n for n in inventory if n.startswith('embench:dma:')] + ['microbench']
+        workloads = self.correctness + [n for n in inventory if n.startswith('embench:dma:')] + ['microbench']
         if baseline:
             workloads += [n for n in inventory if n.startswith('embench:cpu:')]
         super().__init__(self.dispatch_build, self.dispatch_run, self.map_results, workloads,
@@ -65,20 +65,11 @@ class DMAEvaluator(ChiaEvaluator):
                                     {'error': artifact['stderr'] + '\n' + artifact['stdout'][-6000:], 'failure_stage': 'build'})
         self.artifact = artifact
         self.state.stage(self.task, 'built', {'simulator': artifact['simulator_binary_name']})
-        # Correctness gates run before any performance tasks are dispatched.
-        import asyncio
-        import ray
-        refs = [self.dispatch_run(name) for name in self.correctness]
-        try:
-            results = await asyncio.to_thread(resolve, refs, timeout=self.timeout)
-            self.gate_records = {name: parse(name, result, self.cfg, self.seed) for name, result in zip(self.correctness, results)}
-        except Exception as error:
-            return EvaluationResult({'combined_score': 0.0, 'validity': 0}, {'error': str(error), 'failure_stage': 'correctness'})
         return result
 
     def map_results(self, runs):
         try:
-            records = {**self.gate_records, **{name: parse(name, result, self.cfg, self.seed) for name, result in zip(self.workloads, runs)}}
+            records = {name: parse(name, result, self.cfg, self.seed) for name, result in zip(self.workloads, runs)}
             proposal = read_json(self.run / 'candidates' / self.candidate / 'proposal.json')
             reference_file = self.run / 'reference.json'
             reference = records if self.baseline else read_json(reference_file)

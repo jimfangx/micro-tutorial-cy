@@ -12,7 +12,7 @@ source env.sh
 python loop/bootstrap.py
 python loop/loop.py image
 python loop/loop.py doctor
-python loop/loop.py run --run tutorial
+python loop/loop.py run --run run-001
 ```
 
 `doctor` makes a short real request through the selected CHIA agent inside its
@@ -26,11 +26,14 @@ are not stored in experiments. Each proposal starts a fresh provider session,
 reconstructing context from durable parent/inspiration sources and metrics.
 
 The defaults run two proposals, two islands, up to two concurrent generations,
-one build, and four simulator processes. A first build is expensive. This is a
+one build, and up to 24 simulator processes. A first build is expensive. The full 2 MiB correctness test takes about 80
+minutes per candidate on the development host; the default wall timeout is
+three hours. This is a
 real Chisel/Verilator flow, using the current local Chipyard implementation,
 not a host DMA model. Every configured benchmark runs independently through
 CHIA; each candidate builds **one** SoC simulator, shared by its benchmark tasks.
-Standalone correctness gates finish before performance fan-out. The seed also
+Correctness tests and performance workloads fan out together; every correctness
+gate must pass before a candidate is admitted. The seed also
 runs all CPU-only Embench binaries for a separate comparison.
 
 ## Read the loop
@@ -40,7 +43,7 @@ Start with [search.py](chia_dma/search.py). It is the small orchestration adapte
 1. Call native `OpenEvolveNativeDatabase.sample()` for a parent and inspirations.
 2. Checkpoint selection; dispatch the configured CHIA CLI model in a sandbox.
 3. Save the exact proposal **before** evaluating it.
-4. `DMAEvaluator` uses `ChiaEvaluator` to build once, gate correctness, and fan out.
+4. `DMAEvaluator` uses `ChiaEvaluator` to build once, fan out all tests, and gate admission on correctness.
 5. Calculate fitness and call native `add()` **only** for a valid candidate.
 
 OpenEvolve owns island populations, MAP-Elites cells, sampling, migration, and
@@ -68,15 +71,15 @@ cause a clear invalid result; there are no synthetic cycle estimates.
 ## Recovery
 
 ```sh
-python loop/loop.py status --run tutorial
-python loop/loop.py resume --run tutorial
-python loop/loop.py replay --run tutorial --candidate candidate-<id>
-python loop/loop.py fork --run tutorial \
-  --checkpoint 00000012-updated --new-run tutorial-fork
-python loop/loop.py resume --run tutorial-fork
+python loop/loop.py status --run run-001
+python loop/loop.py resume --run run-001
+python loop/loop.py replay --run run-001 --candidate candidate-<id>
+python loop/loop.py fork --run run-001 \
+  --checkpoint 00000012-updated --new-run run-001-fork
+python loop/loop.py resume --run run-001-fork
 ```
 
-Use an actual checkpoint name from `experiments/tutorial/checkpoints/`.
+Use an actual checkpoint name from `experiments/run-001/checkpoints/`.
 `replay` reevaluates the historical source under a new candidate ID without an
 LLM call or a population update. `resume` restores the native population,
 Python RNG, in-flight tasks, and CHIA SQLite database. A completed proposal,
