@@ -1,0 +1,114 @@
+# All site, agent, search, and evaluation settings live here. Paths are relative
+# to this file; ${HOME} and other environment references are expanded.
+source: ..
+storage: ./experiments
+python: ./.venv/bin/python
+chia: /scratch/jfx/chia-tutorial-chia
+skydiscover: ./.deps/evolve-flows/skydiscover
+evolve_flows: ./.deps/evolve-flows
+runtime:
+  conda: ../.conda-env
+  # This session predates the docker group addition; sg activates membership.
+  docker: [sg, docker, -c]
+  image: chia-dma-local:1
+  image_base: ubuntu:24.04
+  cpus_per_build: 8
+  memory: 24g
+  ray_address: null  # null starts a local CHIA/Ray scheduler
+  ray_cpus: 12
+  generation_slots: 2
+  build_slots: 1
+  simulation_slots: 4
+  task_timeout_seconds: 7200
+  cache_gb: 4
+  environment:
+    JAVA_TOOL_OPTIONS: -Xmx8G -Xss8M -Djava.io.tmpdir=/tmp -Duser.home=/home/ray
+    COURSIER_CACHE: /workspace/.coursier/cache
+agent:
+  backend: antigravity  # antigravity | claude | codex
+  model: null           # null uses the provider's configured default
+  timeout_seconds: 900
+  retries: 1
+  authenticate_before_run: true
+  # Every proposal gets a PRIVATE copy of credentials/session files. No agent
+  # receives the experiment archive, Docker socket, or original checkout.
+  backends:
+    antigravity:
+      binary: ${HOME}/.local/bin/agy
+      credentials: ${HOME}/.gemini
+      credential_target: /home/ray/.gemini
+      gcp_project: agy-tutorial
+      gcp_location: global
+      options: {}
+    claude:
+      binary: ${HOME}/.local/bin/claude
+      credentials: ${HOME}/.claude
+      credential_target: /home/ray/.claude
+      options: {projects_cwd: null}
+    codex:
+      binary: ${HOME}/.local/bin/codex
+      credentials: ${HOME}/.codex
+      credential_target: /home/ray/.codex
+      options: {}
+search:
+  iterations: 2
+  random_seed: 42
+  inspirations: 3
+  num_islands: 2
+  population_size: 40
+  archive_size: 100
+  feature_dimensions: [source_bytes, large_copy_bandwidth]
+  feature_bins: 8
+  exploration_ratio: 0.2
+  exploitation_ratio: 0.7
+  elite_selection_ratio: 0.1
+  migration_interval: 2
+  migration_rate: 0.1
+  island_guidance:
+    - Reduce small-copy latency and setup overhead.
+    - Increase large-copy throughput and overlap accelerator-local requests.
+hardware:
+  config: DMARocketConfig
+  config_package: chipyard
+  allowlist:
+    - generators/chipyard/src/main/scala/dma/DMAController.scala
+    - generators/chipyard/src/main/scala/dma/RoCCDMA.scala
+  make_jobs: 8
+  build_timeout_seconds: 3600
+  protocol_command: [java, -Xmx8G, -jar, scripts/sbt-launch.jar,
+    -Dsbt.ivy.home=/workspace/.ivy2, -Dsbt.global.base=/workspace/.sbt,
+    -Dsbt.boot.directory=/workspace/.sbt/boot, "chipyard/testOnly chipyard.dma.DMAControllerSpec"]
+  extra_make_args: {JAVA_HEAP_SIZE: 8G}
+software:
+  # Freeze the existing build flow once per experiment, before generating RTL.
+  build_commands:
+    - [make, -C, software/rocc-dma, libraries,
+       "{workspace}/software/rocc-dma/build/command-smoke.riscv",
+       "{workspace}/software/rocc-dma/build/correctness.riscv",
+       "{workspace}/software/rocc-dma/build/wrapper-dma.riscv",
+       "{workspace}/software/rocc-dma/build/wrapper-cpu.riscv",
+       "{workspace}/software/rocc-dma/build/microbench.riscv"]
+    - [python, software/rocc-dma/scripts/embench.py, build, --modes, cpu, dma]
+  benchmark_inventory: tests/embench-iot/src
+  embench_elf: software/rocc-dma/build/embench-{mode}/src/{benchmark}/{benchmark}
+  standalone:
+    command-smoke: {elf: software/rocc-dma/build/command-smoke.riscv, marker: DMA command smoke PASS}
+    correctness: {elf: software/rocc-dma/build/correctness.riscv, marker: DMA correctness/coherence PASS}
+    wrapper-dma: {elf: software/rocc-dma/build/wrapper-dma.riscv, marker: DMA wrapper PASS}
+    wrapper-cpu: {elf: software/rocc-dma/build/wrapper-cpu.riscv, marker: DMA wrapper PASS}
+    microbench: {elf: software/rocc-dma/build/microbench.riscv, marker: DMA microbenchmark PASS}
+  dram_ini: generators/testchipip/src/main/resources/dramsim2_ini
+  timeout_cycles: 1000000000
+  timeout_seconds: 600
+fitness:
+  embench_weight: 1.0
+  microbench_weight: 1.0
+  workload_weights: {}
+  require_activity_match: true
+  max_area: null
+  max_delay: null
+snapshot:
+  # Excludes generated products, never source files. Submodule contents are
+  # captured as files, with revisions/dirty patches in the seed manifest.
+  exclude_dirs: [.git, .conda-env, loop, loop_context, target, generated-src, output, __pycache__, .bloop, .bsp, .metals, node_modules]
+  exclude_paths: [software/rocc-dma/build, .java_tmp]

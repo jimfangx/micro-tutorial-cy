@@ -12,6 +12,8 @@ The goal is to optimize DMA performance across the full Embench-IoT benchmark su
 
 Chia can be found by sourcing env.sh in the Chipyard root.
 
+This will be for a tutorial so ensure the code is readable and there is minimal code to parse.
+
 ### Reference implementations
 
 - CHIA: https://docs.chialoops.ai/en/main/index.html
