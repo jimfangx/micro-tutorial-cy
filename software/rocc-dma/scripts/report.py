@@ -63,6 +63,10 @@ def main():
         for r in (cpu, dma):
             require(r["result"] == 0 and r["errors"] == 0 and r["main_cycles"] > 0
                     and r["benchmark_cycles"] > 0, f"Failed run: {r['mode']} {bench}")
+            require(r["verification_result"] != 0, f"Native verification failed: {r['mode']} {bench}")
+        require(cpu["benchmark_result"] == dma["benchmark_result"] and
+                cpu["verification_result"] == dma["verification_result"],
+                f"CPU/DMA benchmark result mismatch: {bench}")
         require(cpu["offloaded"] == 0, f"CPU baseline used DMA: {bench}")
         require(dma["intercepted"] == dma["offloaded"] + dma["fallback"],
                 f"Unaccounted wrapped calls: {bench}")
@@ -80,8 +84,9 @@ def main():
         "address, overflow, and overlap rejection. The same suite passed with random TileLink delays.",
         "Controller RTL tests additionally covered held requests/responses, delayed read/write replies,",
         "busy commands, reset, unsupported commands, failed reads, and a failed write after earlier progress.",
-        "Denied/corrupt response handling was exercised via controller fault injection; the normal DRAM",
-        "model does not naturally generate those errors. No FPGA or host-side DMA emulation was used.", "",
+        "Memory-failure handling was tested by controller-level fault injection. The adapter maps TileLink",
+        "denied/corrupt bits to that error input; the full-system DRAM model does not naturally generate",
+        "those failures. No FPGA or host-side DMA emulation was used.", "",
         "The standalone shim test recorded 12 intercepted calls, 5 actual DMA copies, 7 CPU fallbacks,",
         "and 12,936 DMA bytes. The CPU-only shim also passed; `memmove` remained on the CPU.", "",
         "## Copy microbenchmark", "",
@@ -101,6 +106,9 @@ def main():
               "All runs use the same DMARocketConfig RTL. CPU mode has ordinary memcpy; DMA mode enables wrapping.",
               "Main cycles cover initialization, warmup, timed benchmark, and verification; startup and reporting",
               "are excluded. Benchmark cycles cover start_trigger through stop_trigger, with no printing inside.",
+              "Each CPU/DMA pair matched both the benchmark return value and the native verifier result.",
+              "Native verification is inherited unchanged; xgboost's scale-1 threshold is weak, so its raw",
+              "prediction-count return value is compared explicitly rather than relying only on process exit.",
               "Ratios are DMA cycles / CPU cycles; values above 1 mean more cycles.", "",
               "| Benchmark | CPU main | DMA main | Ratio | CPU timed | DMA timed | Timed ratio | DMA use |",
               "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"]

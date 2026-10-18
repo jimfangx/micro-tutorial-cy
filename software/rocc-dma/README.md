@@ -159,3 +159,77 @@ interconnect/coherence, and DRAM implementations are unchanged. Existing
 `tests/atexit-workaround.c` is reused without modification. The pre-existing
 Embench checkout is used as input; its benchmark and support sources remain
 unchanged.
+
+## Embench build and execution
+
+The existing `tests/embench-iot/sconstruct.py` builds the unmodified benchmarks.
+Board support is supplied by `embench/boardsupport.c`, with compiler/linker flags
+and `user_libs` supplied through SCons's existing configuration interface.
+GCC 16 defaults to C23, which conflicts with this Embench version's `bool`
+typedef; both modes therefore use `-std=gnu11` along with identical `-O2`,
+`rv64gc`/`lp64d`/`medany`, and `-fno-builtin-memcpy` flags. Global scale and
+warmup heat are both 1. No benchmark calibration constants are changed.
+
+```sh
+# At the Chipyard root, after sourcing env.sh:
+python software/rocc-dma/scripts/embench.py build
+python software/rocc-dma/scripts/embench.py run --jobs 8
+python software/rocc-dma/scripts/report.py
+```
+
+CPU and DMA builds live in separate `build/embench-cpu` and
+`build/embench-dma` directories. CPU mode uses ordinary libc memcpy with DMA
+submission disabled. DMA mode adds `--wrap=memcpy` and the DMA shim archive via
+`user_libs=rocc_dma m`. `--undefined=__wrap_memcpy` retains the shim even for
+programs whose memcpy references arise only later from libc or HTIF libraries.
+This fixes archive search order without altering those libraries. The original
+CPU memcpy is retained for fallback. Optional CPU-only interception is available:
+
+```sh
+python software/rocc-dma/scripts/embench.py build --modes wrapper
+python software/rocc-dma/scripts/embench.py run --modes wrapper --bench wikisort
+```
+
+The runner executes CPU and DMA wikisort first, waits for both, then runs the
+remaining 18 benchmarks in independent RTL processes. `--jobs` controls host
+concurrency; each simulated system still has one hart and one DMA transfer at a
+time. All modes use the same `DMARocketConfig` and Chipyard `run-binary-fast`
+infrastructure with `LOADMEM=1`. `EXTRA_SIM_OUT_NAME` keeps per-mode harness logs
+separate. A billion-cycle timeout bounds each run; it does not shorten workloads.
+Use `--bench NAME` to select programs (wikisort remains the initial gate).
+
+Board support wraps `main` to measure initialization, warmup, benchmark, and
+verification cycles together. Startup and final reporting are excluded. The
+standard `start_trigger`/`stop_trigger` functions capture the timed region and
+counter snapshots without printing there. Volatile field loads prevent snapshot
+operations from becoming intercepted memcpy calls. `--wrap=verify_benchmark`
+records the benchmark return value and the original verifier result, preserving
+the verifier's behavior. Both CPU/DMA values must match in the final report.
+This matters for inherited weak verifiers, including xgboost's scale-1 check;
+its actual inference loop still executes every sample. Nonzero program exit is
+reported as failure by the existing HTIF simulator, and the runner also requires
+an explicit successful `EMBENCH` result record with no DMA errors.
+
+`build/embench-manifest.json` records shared flags, original source hashes,
+per-mode linker flags, ELF hashes, benchmark-object memcpy references, and linked
+call-site counts. Disassemblies sit next to their ELF files. Completed run
+metrics, ELF/simulator/log hashes, and raw signed return values are recorded in
+`build/embench-results.json`; transcripts are in `build/logs`. A rerun reuses only
+completed records whose binary, simulator, and transcript hashes still match.
+Do not start a duplicate runner while an earlier run is live. After all required
+runs complete, `report.py` checks every standalone gate and every CPU/DMA pair
+before producing `RESULTS.md` and `build/measurements.json`.
+
+The complete reproducible sequence is `software/rocc-dma/scripts/verify.sh`.
+It runs the baseline, command smoke, controller protocol tests, both coherent
+correctness configurations, wrapper tests, microbenchmark, Embench builds and
+runs, and final reporting. The optional Embench wrapper mode is supported but
+is outside the required CPU/DMA comparison; its library is tested standalone.
+
+The supplied benchmark input is recorded as the `tests/embench-iot` submodule in
+`.gitmodules`, pinned to `09c2ed8`. That entry makes the benchmark dependency
+reproducible; initialize the submodule before running these commands in a fresh
+checkout. Its upstream benchmark and support files are used without edits.
+The Rocket, inclusive-cache, TestChipIP, and DRAMSim2 submodule commits match the
+original Chipyard base, with clean worktrees. Existing conda/environment changes
+in this workspace belong to the supplied toolchain setup.
