@@ -3,16 +3,10 @@
 from pathlib import Path
 import copy
 import json
-import random
 import pytest
 
 from chia_dma.config import ALLOWLIST, digest, load
-from chia_dma.artifacts import (
-    archive_proposal,
-    read_json,
-    source_bundle,
-    validate_bundle,
-)
+from chia_dma.artifacts import validate_bundle
 from chia_dma.metrics import aggregate, parse
 
 
@@ -31,17 +25,13 @@ def records(cfg):
     result = {}
     for row in data["embench"]:
         name = f'embench:{row["mode"]}:{row["benchmark"]}'
-        # Historical full-suite fixture predates metrics version 1. It is input
-        # to aggregation tests only; the runtime parser must reject it now.
+        # Recorded cycle/activity inputs exercise aggregation; parser validation
+        # is covered separately with complete version-1 observations.
         result[name] = dict(row)
-    copies = copy.deepcopy(data["microbench"])
-    for row in copies:
-        row["bandwidth_bytes_per_cycle"] = row["bytes"] / row["dma_cycles"]
-    result["microbench"] = {"copies": copies}
     return result
 
 
-def test_real_rtl_reference_and_group_weighted_geomean(cfg, records):
+def test_embench_reference_and_weighted_geomean(cfg, records):
     score, vector = aggregate(records, records, cfg, {p: "source" for p in ALLOWLIST})
     assert score["combined_score"] == 1
     assert len([k for k in vector if k.startswith("embench:")]) == len(records) // 2
@@ -49,9 +39,28 @@ def test_real_rtl_reference_and_group_weighted_geomean(cfg, records):
     for name, row in faster.items():
         if name.startswith("embench:dma:"):
             row["benchmark_cycles"] /= 4
-    cfg["fitness"].update(embench_weight=1, microbench_weight=1)
     score, _ = aggregate(faster, records, cfg, {p: "source" for p in ALLOWLIST})
-    assert score["combined_score"] == pytest.approx(2)
+    assert score["combined_score"] == pytest.approx(4)
+    active = [
+        r
+        for k, r in records.items()
+        if k.startswith("embench:dma:") and r["region_offloaded"]
+    ]
+    assert score["dma_bytes_per_cycle"] == pytest.approx(
+        sum(r["region_bytes"] for r in active)
+        / sum(r["benchmark_cycles"] / 4 for r in active)
+    )
+    key = next(
+        k
+        for k, r in records.items()
+        if k.startswith("embench:dma:") and r["region_offloaded"]
+    )
+    cfg["fitness"]["workload_weights"] = {key: 2}
+    faster[key]["benchmark_cycles"] *= 4
+    score, _ = aggregate(faster, records, cfg, {p: "source" for p in ALLOWLIST})
+    assert score["combined_score"] == pytest.approx(
+        4 ** ((len(active) - 1) / (len(active) + 1))
+    )
 
 
 def test_activity_change_missing_workload_and_wrong_output_rejected(cfg, records):
@@ -75,61 +84,71 @@ def test_failed_or_incomplete_simulation_never_yields_score(cfg):
         {"success": True, "returncode": 0, "log": "EMBENCH result=0", "out": ""},
     ):
         with pytest.raises(ValueError):
-            parse("embench:dma:wikisort", result, cfg)
-    with pytest.raises(ValueError):
-        parse(
-            "microbench",
-            {
-                "success": True,
-                "returncode": 0,
-                "log": "DMA microbenchmark PASS",
-                "out": "",
-            },
-            cfg,
-        )
+            parse(result, cfg)
 
 
 def test_passive_hardware_metrics_are_required_by_chia(cfg, tmp_path):
-    cfg["software"]["standalone"]["basic"] = {"marker": "DMA basic PASS"}
-    fixture = (
-        Path(__file__).resolve().parents[2]
-        / "software/rocc-dma/tests/fixtures/observed-basic.txt"
-    )
+    fixture = Path(__file__).parent / "fixtures/embench-observation.txt"
     parser = tmp_path / "tree/software/rocc-dma/scripts/metrics.py"
     parser.parent.mkdir(parents=True)
-    parser.write_text((fixture.parents[2] / "scripts/metrics.py").read_text())
+    parser.write_text(
+        (Path(cfg["source"]) / cfg["software"]["metrics_parser"]).read_text()
+    )
     text = fixture.read_text()
     result = {"success": True, "returncode": 0, "log": text, "out": ""}
-    row = parse("basic", result, cfg, tmp_path / "tree")
+    row = parse(result, cfg, tmp_path / "tree")
     assert row["hardware"]["write_acks"] == 1
     assert row["copy_events"][0]["hw_cycles"] == 34
     with pytest.raises(ValueError):
         parse(
-            "basic",
             {**result, "log": text.replace("outstanding=0", "outstanding=1")},
             cfg,
             tmp_path / "tree",
         )
 
 
-def test_proposal_commit_is_immutable_and_has_exact_allowlist(tmp_path):
-    bundle = {p: "original\n" for p in ALLOWLIST}
-    modified = dict(bundle)
-    modified[ALLOWLIST[0]] += "// proposal\n"
-    archive_proposal(
-        tmp_path, "candidate", modified, bundle, {"parent_id": "seed", "iteration": 1}
+def test_proposal_commit_is_immutable_and_has_exact_allowlist(tmp_path, cfg):
+    from chia_dma.state import State
+    from skydiscover.search.base_database import Program
+
+    import ray
+
+    ray.init(
+        address="local",
+        num_cpus=1,
+        include_dashboard=False,
+        object_store_memory=128 * 1024 * 1024,
     )
-    saved = read_json(tmp_path / "candidates/candidate/proposal.json")
-    assert saved["source_hash"] == digest(modified)
-    assert source_bundle(tmp_path / "candidates/candidate/rtl") == modified
-    with pytest.raises(ValueError):
-        archive_proposal(tmp_path, "candidate", bundle, bundle, {})
-    with pytest.raises(ValueError):
-        validate_bundle({**bundle, "tests/cheat.c": "bad"})
+    state = State(cfg, tmp_path)
+    try:
+        bundle = {p: "original\n" for p in ALLOWLIST}
+        modified = {**bundle, ALLOWLIST[0]: "original\n// proposal\n"}
+        state.reserve(
+            Program(
+                id="seed",
+                solution=json.dumps({"source": bundle}),
+                metadata={"island": 0},
+            ),
+            [],
+            cid="candidate",
+        )
+        saved = state.complete(
+            "candidate", modified, {"response": "generated", "backend": "codex"}
+        )
+        assert saved["source_hash"] == digest(modified) and saved["source"] == modified
+        assert saved["generation"]["response"] == "generated"
+        assert not (tmp_path / "candidates").exists()
+        with pytest.raises(ValueError):
+            state.complete("candidate", bundle, {})
+        with pytest.raises(ValueError):
+            validate_bundle({**bundle, "tests/cheat.c": "bad"})
+    finally:
+        state.close()
+        ray.shutdown()
 
 
 def test_all_three_real_chia_agent_classes_are_configurable(cfg):
-    from chia_dma.agents import make_agent
+    from chia_dma.adapter import make_agent
 
     names = {
         "antigravity": "AntigravityLLM",
@@ -160,3 +179,42 @@ def test_allowlisted_file_cannot_change_fixed_soc_mixin_or_l1():
     with pytest.raises(ValueError, match="L1"):
         validate_integration(candidate, source)
     validate_integration(source, source)
+
+
+def test_antigravity_overrides_are_optional_and_only_change_requested_private_fields(
+    cfg, tmp_path, monkeypatch
+):
+    from chia_dma.adapter import override_antigravity
+
+    monkeypatch.setenv("HOME", str(tmp_path / "private-home"))
+    folder = Path.home() / ".gemini/antigravity-cli"
+    folder.mkdir(parents=True)
+    settings = folder / "settings.json"
+    token = folder / "antigravity-oauth-token"
+    settings.write_text(
+        json.dumps(
+            {
+                "gcp": {"project": "saved-project", "location": "saved-region"},
+                "keep": True,
+            }
+        )
+    )
+    token.write_text(
+        json.dumps(
+            {"project_id": "saved-project", "region": "saved-region", "keep": True}
+        )
+    )
+    before = settings.read_bytes(), token.read_bytes()
+    override_antigravity(cfg)
+    assert (settings.read_bytes(), token.read_bytes()) == before
+    cfg["agent"]["backends"]["antigravity"]["gcp_project"] = "explicit-project"
+    override_antigravity(cfg)
+    assert json.loads(settings.read_text()) == {
+        "gcp": {"project": "explicit-project", "location": "saved-region"},
+        "keep": True,
+    }
+    assert json.loads(token.read_text()) == {
+        "project_id": "explicit-project",
+        "region": "saved-region",
+        "keep": True,
+    }

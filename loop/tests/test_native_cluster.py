@@ -1,47 +1,114 @@
-"""Real native up/down, separate parents, and forbidden BashTool writes."""
+"""Native host-network workers: filesystem boundaries, reuse, and real CLI calls."""
 
-from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 import copy
 import json
-from pathlib import Path
-import subprocess
-import uuid
 import os
-import pytest
-import hashlib
-import socket
+import subprocess
 import time
+import pytest
+import ray
+from chia.base.ChiaFunction import ChiaFunction, get
 from chia_dma.config import ALLOWLIST
-from chia_dma.artifacts import write_json
-from chia_dma.deployment import render, chia, expand
+from chia_dma.runtime import render
 from native_fixture import native_ssh
 
 
-def test_native_generation_clusters_enforce_concurrent_parent_boundaries(native_ssh):
-    original, base = native_ssh
-    cfg = copy.deepcopy(original)
-    credentials = base / "empty-credentials"
-    credentials.mkdir()
-    cfg["agent"]["backends"][cfg["agent"]["backend"]]["credentials"] = str(credentials)
-    cfg["agent"]["backends"][cfg["agent"]["backend"]]["mounts"] = []
-    run = base / "boundary"
+def chia(cfg, action, path):
+    """Tests invoke the upstream CLI, just as the documented procedure does."""
+    result = subprocess.run(
+        [cfg["python"], "-m", "chia.cli.main", action, str(path), "-y"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr[-5000:] + result.stdout[-3000:]
+
+
+def cluster(cfg, base, name, *, pools=False):
+    cfg = copy.deepcopy(cfg)
+    run = base / (name + "-" + base.name[-8:])
     run.mkdir()
     seed = run / "seed"
-    tree = seed / "tree"
-    for name in (*ALLOWLIST, "build.sbt", "software/benchmark.c"):
-        p = tree / name
+    for n in (*ALLOWLIST, "build.sbt", "software/benchmark.c"):
+        p = seed / "tree" / n
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("FROZEN")
-    listener = socket.socket()
-    listener.bind(("0.0.0.0", 0))
-    listener.listen(8)
-    port = listener.getsockname()[1]
-    with socket.create_connection(("127.0.0.1", port)):
-        pass
-    host = socket.gethostbyname(socket.gethostname())
-    script = """from pathlib import Path
-import socket, struct, errno
-p=Path('/workspace/generators/chipyard/src/main/scala/dma/DMAController.scala')
+    (seed / "tree/frozen").write_text("preserved source")
+    if not pools:
+        node = cfg["cluster"]["available_node_types"]["generation"]
+        cfg["cluster"]["available_node_types"] = {"generation": node}
+    path = render(cfg, run, seed)
+    return cfg, run, seed, path
+
+
+def attach(cfg):
+    ray.init(
+        address=cfg["runtime"]["ray_address"],
+        namespace="native-proof",
+        runtime_env={
+            "env_vars": {
+                "PYTHONPATH": ":".join(
+                    [
+                        "/opt/loop",
+                        "/opt/chia",
+                        "/opt/skydiscover",
+                        str(Path(__file__).resolve().parents[1]),
+                        cfg["chia"],
+                        cfg["skydiscover"],
+                        cfg["evolve_flows"],
+                    ]
+                )
+            }
+        },
+    )
+
+
+@ray.remote(num_cpus=0, max_concurrency=3)
+class Ready:
+    def __init__(self):
+        self.count = 0
+
+    def arrive(self):
+        self.count += 1
+        deadline = time.monotonic() + 30
+        while self.count < 2:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Second generation worker did not reach BashTool")
+            time.sleep(0.02)
+
+
+@ChiaFunction(resources={"generation": 1}, max_retries=0)
+def boundary_probe(mark, ready, sql, delay=0.2):
+    import os
+    import shlex
+    import time
+    from pathlib import Path
+    import ray
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+    from chia.base.tools.BashTool import BashTool
+    from chia_dma.config import ALLOWLIST
+
+    # Match production's parent initialization before giving the agent its shell.
+    for name in ALLOWLIST:
+        (Path("/workspace") / name).write_text(mark)
+    tool = BashTool(
+        "boundary_bash",
+        work_dir="/workspace",
+        task_options={
+            "scheduling_strategy": NodeAffinitySchedulingStrategy(
+                ray.get_runtime_context().get_node_id(), soft=False
+            )
+        },
+    )
+    ray.get(ready.arrive.remote())
+    started = time.time()
+    try:
+        script = (
+            """from pathlib import Path
+import errno
+p=Path('/workspace/"""
+            + ALLOWLIST[0]
+            + """')
 print('PARENT='+p.read_text())
 p.write_text(p.read_text()+' edited')
 for name in ['/workspace/build.sbt','/workspace/software/benchmark.c','/opt/loop/chia_dma/evaluation.py']:
@@ -52,182 +119,170 @@ for name in ['/workspace/build.sbt','/workspace/software/benchmark.c','/opt/loop
  else: raise RuntimeError('Forbidden write succeeded')
 assert not Path('/var/run/docker.sock').exists()
 assert not Path('/opt/loop/experiments').exists()
-try: socket.create_connection(('127.0.0.1',6387),timeout=0.2)
-except OSError: print('RAY_ISOLATED')
-else: raise RuntimeError('Trusted Ray reachable')
-gateway = next(socket.inet_ntoa(struct.pack('<L',int(line.split()[2],16))) for line in Path('/proc/net/route').read_text().splitlines()[1:] if line.split()[1] == '00000000')
-for host in [gateway, 'HOST_IP']:
- try: socket.create_connection((host, HOST_PORT),timeout=0.2)
- except OSError: print('HOST_DENIED='+host)
- else: raise RuntimeError('Host services reachable: '+host)
-""".replace("HOST_IP", host).replace("HOST_PORT", str(port))
+"""
+        )
+        output = tool.run_command("python -c " + shlex.quote(script))
+        time.sleep(delay)
+        assert (Path("/workspace") / ALLOWLIST[0]).read_text() == mark + " edited"
+        assert (Path("/workspace") / ALLOWLIST[1]).read_text() == mark
+        from chia_dma.state import complete
+        from chia_dma.artifacts import source_bundle
 
-    def one(mark):
-        work = run / mark
-        work.mkdir()
-        for name in ALLOWLIST:
-            (work / Path(name).name).write_text(mark)
-        task = {"id": "boundary-" + mark + "-" + uuid.uuid4().hex}
-        path, values = render(cfg, run, seed, request=task, work=work)
-        try:
-            chia(cfg, "up", path)
-            import shlex
-
-            request = {
-                "cfg": cfg,
-                "action": "isolation",
-                "command": "python -c " + shlex.quote(script),
-            }
-            result = subprocess.run(
-                expand(cfg["generation_exec"], values),
-                input=json.dumps(request),
-                text=True,
-                capture_output=True,
-                timeout=120,
-                check=True,
-            )
-            marker = "CHIA_AGENT_RESULT="
-            data = json.loads(
-                next(
-                    line[len(marker) :]
-                    for line in result.stdout.splitlines()
-                    if line.startswith(marker)
-                )
-            )
-            assert "PARENT=" + mark in data["output"]
-            assert (
-                sum(line.startswith("DENIED=") for line in data["output"].splitlines())
-                == 3
-                and "RAY_ISOLATED" in data["output"]
-                and data["output"].count("HOST_DENIED=") == 2
-            )
-            assert (work / "DMAController.scala").read_text() == mark + " edited"
-            assert all(
-                (tree / n).read_text() == "FROZEN"
-                for n in (*ALLOWLIST, "build.sbt", "software/benchmark.c")
-            )
-        finally:
-            chia(cfg, "down", path)
-
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            list(pool.map(one, ["parent-A", "parent-B"]))
+        assert not Path(sql.db_path).exists()
+        complete(
+            sql,
+            mark,
+            source_bundle("/workspace"),
+            {"response": "BashTool boundary proof"},
+            remote=True,
+        )
+        return {
+            "node": ray.get_runtime_context().get_node_id(),
+            "started": started,
+            "ended": time.time(),
+            "output": output,
+        }
     finally:
-        listener.close()
+        tool.stop()
 
 
-def test_native_build_simulation_pools_and_scoped_down(native_ssh):
-    from chia.base.ChiaFunction import ChiaFunction, get
-    import ray
-
+def test_native_generation_parent_separation_forbidden_writes_and_serial_reuse(
+    native_ssh,
+):
     cfg, base = native_ssh
-    run = base / "native-pools"
-    run.mkdir()
-    seed = run / "seed"
-    (seed / "tree").mkdir(parents=True)
-    (seed / "tree/frozen").write_text("preserved source")
-    work = run / "generation-work"
-    work.mkdir()
-    for name in ALLOWLIST:
-        p = seed / "tree" / name
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("preserved source")
-        (work / Path(name).name).write_text("selected parent")
-    credentials = run / "empty-credentials"
+    cfg = copy.deepcopy(cfg)
+    credentials = base / "empty-credentials"
     credentials.mkdir()
-    backend = cfg["agent"]["backends"][cfg["agent"]["backend"]]
-    backend["credentials"], backend["mounts"] = str(credentials), []
-    path, _ = render(cfg, run, seed)
+    cfg["agent"]["backends"][cfg["agent"]["backend"]]["credentials"] = str(credentials)
+    cfg["agent"]["backends"][cfg["agent"]["backend"]]["mounts"] = []
+    cfg, run, seed, path = cluster(cfg, base, "boundaries")
     try:
         chia(cfg, "up", path)
-        ray.init(address=cfg["runtime"]["ray_address"], namespace="native-pool-proof")
+        attach(cfg)
+        from chia_dma.state import State
+        from skydiscover.search.base_database import Program
+
+        state = State(cfg, run)
+        for mark in ("parent-A", "parent-B", "parent-C"):
+            state.reserve(
+                Program(
+                    id=mark,
+                    solution=json.dumps({"source": {n: mark for n in ALLOWLIST}}),
+                    metadata={"island": 0},
+                ),
+                [],
+                cid=mark,
+            )
+        ready = Ready.remote()
+        results = [
+            get(h)
+            for h in [
+                boundary_probe.chia_remote(mark, ready, state.sql, 1)
+                for mark in ("parent-A", "parent-B", "parent-C")
+            ]
+        ]
+        assert len({r["node"] for r in results}) == 2
+        for mark, result in zip(("parent-A", "parent-B", "parent-C"), results):
+            assert "PARENT=" + mark in result["output"]
+            assert result["output"].count("DENIED=") == 3
+            assert state.proposal(mark)["source"][ALLOWLIST[0]] == mark + " edited"
+        for a, b in [(results[i], results[j]) for i in range(3) for j in range(i)]:
+            if a["node"] == b["node"]:
+                assert a["started"] >= b["ended"] or b["started"] >= a["ended"]
+        assert any(
+            a["started"] < b["ended"] and b["started"] < a["ended"]
+            for a, b in [
+                (results[0], results[1]),
+                (results[0], results[2]),
+                (results[1], results[2]),
+            ]
+        )
+        from chia.base.bypass import Bypass
+        from chia_dma.runtime import has_proposal, from_proposal
+
+        bypass = Bypass(cfg["_config_file"])
+        bypass.set_cond("generate", has_proposal)
+        bypass.set_provider("generate", from_proposal)
+
+        @ChiaFunction(resources={"generation": 1})
+        def generate(cfg, sql, task):
+            raise AssertionError("Completed proposal called the LLM again")
+
+        recovered = get(generate.chia_remote(cfg, state.sql, {"id": "parent-A"}))
+        assert recovered["source"] == state.proposal("parent-A")["source"]
+        state.close()
+        assert all(
+            (seed / "tree" / n).read_text() == "FROZEN"
+            for n in (*ALLOWLIST, "build.sbt", "software/benchmark.c")
+        )
+    finally:
+        ray.shutdown()
+        chia(cfg, "down", path)
+
+
+@ChiaFunction(resources={"verilator_run": 1}, max_retries=0)
+def simulation_probe(mark):
+    from chia.chipyard.state_def import BuildArtifact
+    from chia.chipyard.verilator_run_node import VerilatorRunNode
+
+    script = (
+        "#!/bin/sh\necho BUILD_"
+        + mark
+        + '\nsleep 1\nfor arg; do last=$arg; done\ncat "$last"\n'
+    ).encode()
+    artifact = BuildArtifact(
+        mark,
+        script,
+        "same-simulator",
+        "fixture",
+        "fixture",
+        "verilator",
+        True,
+        "",
+        "",
+        0,
+    )
+    result = VerilatorRunNode().run(
+        artifact,
+        ("INPUT_" + mark + "\n").encode(),
+        "same-input.riscv",
+        "/tmp/staging-proof",
+        timeout_seconds=10,
+    )
+    assert result.success
+    return result.log
+
+
+def test_native_build_simulation_worker_placement(native_ssh):
+    cfg, base = native_ssh
+    cfg, run, seed, path = cluster(cfg, base, "pools", pools=True)
+    try:
+        chia(cfg, "up", path)
+        attach(cfg)
 
         @ChiaFunction()
         def probe():
             import os
             from pathlib import Path
 
-            return {
-                "namespace": os.readlink("/proc/self/ns/mnt"),
-                "tree": (
-                    Path("/workspace/chipyard/frozen").read_text()
-                    if Path("/workspace/chipyard/frozen").exists()
-                    else None
-                ),
-            }
+            p = Path("/home/ray/dma-build/frozen")
+            return os.readlink("/proc/self/ns/mnt"), (
+                p.read_text() if p.exists() else None
+            )
 
-        b = get(probe.options(resources={"chipyard": 1}).chia_remote())
-        s = get(probe.options(resources={"verilator_run": 1}).chia_remote())
-        assert b["namespace"] != s["namespace"]
-        assert b["tree"] == "preserved source" and s["tree"] is None
+        build = get(probe.options(resources={"chipyard": 1}).chia_remote())
+        simulation = get(probe.options(resources={"verilator_run": 1}).chia_remote())
+        assert (
+            build[0] != simulation[0]
+            and build[1] == "preserved source"
+            and simulation[1] is None
+        )
         assert ray.cluster_resources()["generation"] == 2
-        # Simulate interruption while the agent's private Ray/BashTool is live.
-        generation, values = render(
-            cfg, run, seed, request={"id": "interrupted-" + uuid.uuid4().hex}, work=work
-        )
-        proc = None
-        try:
-            chia(cfg, "up", generation)
-            proc = subprocess.Popen(
-                expand(cfg["generation_exec"], values),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True,
-            )
-            proc.stdin.write(
-                json.dumps(
-                    {
-                        "cfg": cfg,
-                        "action": "isolation",
-                        "command": "touch /tmp/tool-running; sleep 120",
-                    }
-                )
-            )
-            proc.stdin.close()
-            for _ in range(100):
-                ready = subprocess.run(
-                    [
-                        "sudo",
-                        "docker",
-                        "exec",
-                        values["CONTAINER"],
-                        "test",
-                        "-f",
-                        "/tmp/tool-running",
-                    ],
-                    capture_output=True,
-                )
-                if ready.returncode == 0:
-                    break
-                assert (
-                    proc.poll() is None
-                ), "Private generation exited before interruption"
-                time.sleep(0.1)
-            else:
-                pytest.fail("Private BashTool did not start")
-        finally:
-            chia(cfg, "down", generation)
-            if proc:
-                proc.wait(timeout=20)
-        assert (
-            subprocess.run(
-                ["sudo", "docker", "inspect", values["CONTAINER"]], capture_output=True
-            ).returncode
-            != 0
-        )
-        assert (
-            subprocess.run(
-                ["sudo", "docker", "network", "inspect", values["NETWORK"]],
-                capture_output=True,
-            ).returncode
-            != 0
-        )
-        # Dedicated generation teardown must leave the trusted cluster alive.
-        assert (
-            get(probe.options(resources={"chipyard": 1}).chia_remote())["tree"]
-            == "preserved source"
-        )
+        handles = [simulation_probe.chia_remote(mark) for mark in ("A", "B")]
+        assert [get(h).strip() for h in handles] == [
+            "BUILD_A\nINPUT_A",
+            "BUILD_B\nINPUT_B",
+        ]
     finally:
         ray.shutdown()
         chia(cfg, "down", path)
@@ -235,61 +290,37 @@ def test_native_build_simulation_pools_and_scoped_down(native_ssh):
 
 @pytest.mark.skipif(
     os.environ.get("CHIA_LIVE_AGENTS") != "1",
-    reason="Opt-in calls to authenticated CLI providers",
+    reason="Opt-in authenticated provider calls",
 )
 @pytest.mark.parametrize("backend", ["antigravity", "claude", "codex"])
-def test_cli_backends_invoke_native_bash_tool(native_ssh, backend):
+def test_cli_backend_uses_native_bash_tool(native_ssh, backend):
+    from chia_dma.adapter import generate
+    from chia_dma.config import digest
+    from chia_dma.artifacts import source_bundle, write_json
+
     original, base = native_ssh
     cfg = copy.deepcopy(original)
     cfg["agent"]["backend"] = backend
-    run = base / ("cli-" + backend)
-    run.mkdir()
-    seed = run / "seed"
-    tree = seed / "tree"
-    work = run / "work"
-    work.mkdir()
-    content = uuid.uuid4().hex
-    for name in ALLOWLIST:
-        p = tree / name
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
-        (work / Path(name).name).write_text(content)
-    request = {"id": "cli-" + uuid.uuid4().hex}
-    path, values = render(cfg, run, seed, request=request, work=work)
-    prompt = (
-        "Please use dma_bash_run_command to calculate the SHA-256 of /workspace/"
-        + ALLOWLIST[0]
-        + " and report the computed checksum."
-    )
+    cfg, run, seed, path = cluster(cfg, base, "cli-" + backend)
+    # New private content cannot be inferred from the checksum request.
+    import uuid
+
+    source = {n: uuid.uuid4().hex for n in ALLOWLIST}
+    task = {
+        "id": "auth",
+        "auth": True,
+        "parent": {"solution": json.dumps({"source": source})},
+        "island": 0,
+    }
     try:
         chia(cfg, "up", path)
-        process = subprocess.run(
-            expand(cfg["generation_exec"], values),
-            input=json.dumps({"cfg": cfg, "prompt": prompt}),
-            capture_output=True,
-            text=True,
-            timeout=cfg["agent"]["timeout_seconds"] + 120,
-            check=False,
-        )
-        assert process.returncode == 0, process.stderr[-16000:] + process.stdout[-3000:]
-        marker = "CHIA_AGENT_RESULT="
-        result = json.loads(
-            next(
-                line[len(marker) :]
-                for line in process.stdout.splitlines()
-                if line.startswith(marker)
-            )
-        )
+        attach(cfg)
+        result = get(generate.chia_remote(cfg, None, task))
         write_json(run / "result.json", result)
-        assert hashlib.sha256(content.encode()).hexdigest() in result["response"]
+        assert digest(source[ALLOWLIST[0]].encode()) in result["response"]
+        assert result["source"] == source
         if backend != "claude":
-            assert "[Tool Call:" in result["transcript"]
-            calls = result["transcript"][result["transcript"].index("[Tool Call:") :]
-            assert "dma_bash" in calls
-        assert (work / "DMAController.scala").read_text() == content
-        write_json(
-            run / "tool-proof.json",
-            {"backend": backend, "tool_called": True, "source_unchanged": True},
-        )
+            assert "dma_bash" in result["transcript"]
     finally:
+        ray.shutdown()
         chia(cfg, "down", path)

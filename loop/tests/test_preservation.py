@@ -1,9 +1,8 @@
 """Seed restoration is independent of the original Git checkout."""
 
-from pathlib import Path
 import shutil
 from chia_dma.config import ALLOWLIST, load
-from chia_dma.artifacts import git, snapshot, read_json, source_bundle, archive_proposal
+from chia_dma.artifacts import git, snapshot, read_json, source_bundle
 
 
 def test_preserved_seed_includes_uncommitted_inputs_and_restores_after_source_removal(

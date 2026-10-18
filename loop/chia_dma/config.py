@@ -14,6 +14,7 @@ ALLOWLIST = (
 )
 
 
+# Computes stable SHA-256 identifiers for source/configuration and cache keys.
 def digest(value):
     data = (
         value
@@ -23,6 +24,7 @@ def digest(value):
     return hashlib.sha256(data).hexdigest()
 
 
+# Loads YAML, expands environment variables, resolves paths, and validates settings.
 def load(path=ROOT / "config.yaml"):
     path = Path(path).resolve()
     cfg = yaml.safe_load(os.path.expandvars(path.read_text()))
@@ -31,12 +33,19 @@ def load(path=ROOT / "config.yaml"):
     cfg["python"] = os.path.abspath(path.parent / cfg["python"])
     cfg["runtime"]["conda"] = str((path.parent / cfg["runtime"]["conda"]).resolve())
     for backend in cfg["agent"]["backends"].values():
-        for key in ("binary", "credentials"):
-            backend[key] = str((path.parent / backend[key]).resolve())
-        backend["extra_binaries"] = {
-            name: str((path.parent / binary).resolve())
-            for name, binary in backend.get("extra_binaries", {}).items()
-        }
+        backend["credentials"] = str((path.parent / backend["credentials"]).resolve())
+    generation = cfg["cluster"]["available_node_types"]["generation"]
+    if generation["resources"] != {"generation": 1} or generation["num_workers"] < 1:
+        raise ValueError(
+            "Each generation workspace needs one serial generation slot; increase num_workers for concurrency"
+        )
+    if (
+        cfg["cluster"]["available_node_types"]["build"]["resources"].get("chipyard")
+        != 1
+    ):
+        raise ValueError(
+            "Each private build checkout requires one serial chipyard slot; increase num_workers for parallel builds"
+        )
     if tuple(cfg["hardware"]["allowlist"]) != ALLOWLIST:
         raise ValueError(
             "The DMA implementation allowlist is fixed; establish a new integration to expand it"
@@ -51,6 +60,7 @@ def load(path=ROOT / "config.yaml"):
     return cfg
 
 
+# Selects settings that must remain unchanged when resuming an experiment.
 def frozen(cfg):
     """Backend/model may change on resume; evaluation and search rules may not."""
     data = copy.deepcopy(cfg)
@@ -66,16 +76,9 @@ def frozen(cfg):
         "storage",
         "source",
         "cluster",
-        "generation_cluster",
-        "generation_ray",
-        "generation_exec",
-        "image_build",
-        "image_inspect",
     ):
         data.pop(key, None)
-    data["runtime"] = {
-        k: v for k, v in data["runtime"].items() if k in ("image", "environment")
-    }
+    data.pop("runtime", None)
     data["worker_contract"] = {
         name: {
             "image": node["docker"]["image"],
@@ -84,6 +87,7 @@ def frozen(cfg):
             "setup": node.get("worker_setup_commands", []),
         }
         for name, node in cfg["cluster"]["available_node_types"].items()
+        if name != "generation"
     }
     data["search"].pop("iterations", None)
     data["search"].pop("max_in_flight", None)

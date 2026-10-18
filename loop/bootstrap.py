@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Install loop-only dependencies using the paths/revision in config.yaml."""
+"""Install loop-only dependencies using the paths/revisions in config.yaml."""
+
+# Setup steps: (1) clone/check out pinned CHIA; (2) clone/check out evolve-flows
+# and initialize its pinned SkyDiscover submodule; (3) create a loop-local venv
+# inheriting the activated Chipyard/Ray toolchain; (4) install the OpenAI client
+# used by SkyDiscover and pytest; (5) install CHIA, SkyDiscover, and evolve-flows
+# editable without replacing toolchain dependencies; (6) prefer this CHIA checkout
+# over inherited editable installs. Native `chia up` pulls the pinned upstream
+# worker images; there is no custom image build or dependency patch.
 
 from pathlib import Path
 import subprocess
-import sys
 import venv
-from chia_dma.config import ROOT, load
+from chia_dma.config import load
 
 cfg = load()
 chia = Path(cfg["chia"])
@@ -17,12 +24,6 @@ subprocess.run(
     ["git", "-C", str(chia), "checkout", cfg["dependencies"]["chia_revision"]],
     check=True,
 )
-patch = ROOT / "patches/chia-native.patch"
-if subprocess.run(
-    ["git", "-C", str(chia), "apply", "--reverse", "--check", str(patch)],
-    capture_output=True,
-).returncode:
-    subprocess.run(["git", "-C", str(chia), "apply", str(patch)], check=True)
 target = Path(cfg["evolve_flows"])
 if not (target / ".git").exists():
     subprocess.run(
@@ -78,4 +79,4 @@ site = subprocess.check_output(
 (Path(site) / "chia_tutorial.pth").write_text(
     "import sys; sys.path.insert(0, " + repr(cfg["chia"]) + ")\n"
 )
-print("Ready: image, prepare, native chia up, then run")
+print("Ready: prepare, native chia up, then run")

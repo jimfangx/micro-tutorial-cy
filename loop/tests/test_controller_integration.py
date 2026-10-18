@@ -14,13 +14,12 @@ from chia.chipyard.state_def import BuildArtifact, RunResult
 from skydiscover.search.base_database import Program
 from chia_dma.config import load, ALLOWLIST, digest
 from chia_dma.artifacts import (
-    archive_proposal,
     read_json,
     write_json,
     validate_integration,
 )
-from chia_dma.state import State
-from chia_dma.controller import create_controller
+from chia_dma.state import State, complete
+from chia_dma.search import create_controller
 from chia_dma.adapter import CLIClient, ParentContext
 from chia_dma.evaluation import DMAEvaluator
 from chia_dma.runtime import cache_hit, from_cache, has_proposal, from_proposal
@@ -60,6 +59,7 @@ def flow(tmp_path, monkeypatch, request):
     cfg["storage"] = str(tmp_path)
     root = Path(__file__).resolve().parents[1]
     ray.init(
+        address="local",
         num_cpus=6,
         resources={"generation": 2, "chipyard": 1, "verilator_run": 2},
         include_dashboard=False,
@@ -94,27 +94,29 @@ def flow(tmp_path, monkeypatch, request):
         p = tree / name
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text)
-    fixture = root.parent / "software/rocc-dma/tests/fixtures/observed-basic.txt"
+    fixture = root / "tests/fixtures/embench-observation.txt"
     parser = tree / cfg["software"]["metrics_parser"]
     parser.parent.mkdir(parents=True)
-    parser.write_text((fixture.parents[2] / "scripts/metrics.py").read_text())
-    output = fixture.read_text() + "\nDMA command smoke PASS\n"
+    parser.write_text(
+        (Path(cfg["source"]) / cfg["software"]["metrics_parser"]).read_text()
+    )
+    output = fixture.read_text()
     elf = b"fixture ELF"
     write_json(
         run / "software/manifest.json",
         {
             "workloads": {
                 n: {"file": n + ".elf", "sha256": digest(elf)}
-                for n in ("basic", "command-smoke")
+                for n in ("embench:dma:aha-mont64", "embench:dma:crc32")
             }
         },
     )
-    for name in ("basic", "command-smoke"):
+    for name in ("embench:dma:aha-mont64", "embench:dma:crc32"):
         (run / "software" / (name + ".elf")).write_bytes(elf)
     counts = Counts.remote()
 
     @ChiaFunction(resources={"generation": 1})
-    def generate(cfg, run, seed, task):
+    def generate(cfg, sql, task):
         ray.get(counts.add.remote("generate"))
         if ray.get(counts.enter.remote()):
             for _ in range(250):
@@ -127,21 +129,19 @@ def flow(tmp_path, monkeypatch, request):
         child[ALLOWLIST[0]] += "// " + task["id"] + " " + cfg["agent"]["backend"] + "\n"
         if cfg["agent"]["backend"] == "antigravity" and task["island"] == 1:
             child[ALLOWLIST[1]] += "// forbidden integration change\n"
-        archive_proposal(
-            run,
+        saved = complete(
+            sql,
             task["id"],
             child,
-            parent,
             {
-                "island": task["island"],
-                "parent_id": task["parent"]["id"],
                 "backend": cfg["agent"]["backend"],
                 "model": "fixture",
-                "generation": {"response": "fixture"},
+                "response": "fixture",
             },
+            remote=True,
         )
         ray.get(counts.leave.remote())
-        return read_json(Path(run) / "candidates" / task["id"] / "proposal.json")
+        return saved
 
     @ChiaFunction(resources={"chipyard": 1})
     def build(cfg, seed, child):
@@ -176,7 +176,7 @@ def flow(tmp_path, monkeypatch, request):
                 "validity": 1,
                 "combined_score": 1.0,
                 "source_bytes": sum(map(len, source.values())),
-                "large_copy_bandwidth": 1.0,
+                "dma_bytes_per_cycle": 1.0,
             },
             {},
         ),
@@ -200,7 +200,7 @@ def flow(tmp_path, monkeypatch, request):
         metadata={"island": 0},
     )
     state.reserve(parent, [], cid="seed-dma", kind="seed")
-    archive_proposal(run, "seed-dma", source, source, {"backend": None})
+    state.complete("seed-dma", source, {"backend": None})
     evaluator = DMAEvaluator(cfg, state, seed)
     result = evaluator.evaluate(parent.solution)
     assert result.metrics["validity"] == 1, state.sql.query("SELECT * FROM benchmarks")
@@ -221,7 +221,7 @@ def flow(tmp_path, monkeypatch, request):
 def test_full_controller_concurrent_context_invalid_cache_profile_and_resume(flow):
     cfg, state, seed, evaluator, counts, cache, tmp_path = flow
     get(counts.parallel.remote())
-    controller = create_controller(cfg, state, evaluator, seed)
+    controller = create_controller(cfg, state, evaluator)
     asyncio.run(
         controller.run_discovery(
             1, 2, checkpoint_callback=state.checkpoint, retry_times=1
@@ -242,13 +242,13 @@ def test_full_controller_concurrent_context_invalid_cache_profile_and_resume(flo
         state.run / "checkpoints" / saved / "population/openevolve_native_metadata.json"
     )
     assert len(native["islands"]) == 2
-    p = read_json(state.run / "candidates" / valid["id"] / "proposal.json")
+    p = state.proposal(valid["id"])
     # New query identity, identical source: numerical history is cold, CHIA is warm.
     for flush in (False, True):
         if flush:
             get(cache.flush.chia_remote())
         r = state.reserve(Program(**valid["parent"]), [], kind="check")
-        archive_proposal(state.run, r["id"], p["source"], p["source"], {})
+        state.complete(r["id"], p["source"], {})
         result = evaluator.evaluate(
             json.dumps({"proposal_id": r["id"], "source": p["source"]})
         )
@@ -278,7 +278,7 @@ def test_generation_survives_interruption_without_another_llm_call(flow):
     cfg, state, seed, evaluator, counts, cache, tmp_path = flow
     parent, _ = state.population.sample()
     prompt = ParentContext().build_prompt(parent, {})
-    client = CLIClient(cfg, state, seed)
+    client = CLIClient(cfg, state)
     response = asyncio.run(
         client.generate(prompt["system"], [{"role": "user", "content": prompt["user"]}])
     )
@@ -289,7 +289,7 @@ def test_generation_survives_interruption_without_another_llm_call(flow):
     cfg["agent"]["backend"] = "codex"
     restored = State(cfg, state.run)
     resumed = DMAEvaluator(cfg, restored, seed)
-    controller = create_controller(cfg, restored, resumed, seed)
+    controller = create_controller(cfg, restored, resumed)
     try:
         asyncio.run(
             controller.run_discovery(
@@ -308,9 +308,7 @@ def test_generation_survives_interruption_without_another_llm_call(flow):
             child.parent_id == request["parent"]["id"]
             and child.metadata["island"] == request["island"]
         )
-        original = read_json(
-            restored.run / "candidates" / request["id"] / "proposal.json"
-        )
+        original = restored.proposal(request["id"])
         assert original["backend"] == "antigravity"
         # A newly sampled proposal uses the changed backend.
         asyncio.run(
@@ -319,12 +317,7 @@ def test_generation_survives_interruption_without_another_llm_call(flow):
             )
         )
         latest = max(restored.requests(), key=lambda r: r["sequence"])
-        assert (
-            read_json(restored.run / "candidates" / latest["id"] / "proposal.json")[
-                "backend"
-            ]
-            == "codex"
-        )
+        assert restored.proposal(latest["id"])["backend"] == "codex"
     finally:
         restored.close()
 
@@ -337,18 +330,19 @@ def test_historical_fork_retains_pending_context_excludes_future_and_replay_is_i
     cfg, state, seed, evaluator, counts, cache, tmp_path = flow
     write_json(
         state.run / "run.json",
-        {"format": 3, "run_id": state.run.name, "seed": str(seed)},
+        {"run_id": state.run.name, "seed": str(seed)},
     )
     parent, _ = state.population.sample()
     selected = state.request(parent.metadata["request_id"])
     # Checkpoint a selection whose generation has not yet completed.
     cp = state.checkpoint()
-    client = CLIClient(cfg, state, seed)
+    cfg["agent"]["backend"] = "codex"
+    client = CLIClient(cfg, state)
     prompt = ParentContext().build_prompt(parent, {})
     response = asyncio.run(
         client.generate(prompt["system"], [{"role": "user", "content": prompt["user"]}])
     )
-    controller = create_controller(cfg, state, evaluator, seed)
+    controller = create_controller(cfg, state, evaluator)
     state.recovery = state.pending()
     asyncio.run(
         controller.run_discovery(
@@ -364,13 +358,17 @@ def test_historical_fork_retains_pending_context_excludes_future_and_replay_is_i
         assert child.admitted == {"seed-dma"}
         assert [r["id"] for r in child.pending()] == [selected["id"]]
         assert child.request(selected["id"]) == selected
-        assert not (
-            child_path / "candidates" / selected["id"] / "proposal.json"
-        ).exists()
+        assert child.proposal(selected["id"]) is None
+        assert (
+            child.sql.query_value(
+                "SELECT backend FROM proposals WHERE id=?", (selected["id"],)
+            )
+            == selected["backend"]
+        )
         assert child.result(selected["id"]) is None
         before_resume, _ = get(counts.read.remote())
         branch_evaluator = DMAEvaluator(cfg, child, seed)
-        branch_controller = create_controller(cfg, child, branch_evaluator, seed)
+        branch_controller = create_controller(cfg, child, branch_evaluator)
         asyncio.run(
             branch_controller.run_discovery(
                 1, 1, checkpoint_callback=child.checkpoint, retry_times=1
@@ -379,9 +377,9 @@ def test_historical_fork_retains_pending_context_excludes_future_and_replay_is_i
         assert get(counts.read.remote())[0]["generate"] == before_resume["generate"] + 1
         assert selected["id"] in child.admitted
         # A historical replay uses a new tag and never calls the generator/add.
-        p = read_json(state.run / "candidates" / selected["id"] / "proposal.json")
+        p = state.proposal(selected["id"])
         request = child.reserve(Program(**selected["parent"]), [], kind="replay")
-        archive_proposal(child_path, request["id"], p["source"], p["source"], {})
+        child.complete(request["id"], p["source"], {})
         before, _ = get(counts.read.remote())
         replay = DMAEvaluator(cfg, child, seed)
         result = replay.evaluate(
@@ -409,7 +407,7 @@ def test_completed_evaluation_before_admission_recovers_from_sql_without_generat
     cfg, state, seed, evaluator, counts, cache, tmp_path = flow
     parent, _ = state.population.sample()
     prompt = ParentContext().build_prompt(parent, {})
-    client = CLIClient(cfg, state, seed)
+    client = CLIClient(cfg, state)
     response = asyncio.run(
         client.generate(prompt["system"], [{"role": "user", "content": prompt["user"]}])
     )
@@ -423,7 +421,7 @@ def test_completed_evaluation_before_admission_recovers_from_sql_without_generat
     restored = State(cfg, state.run)
     try:
         resumed = DMAEvaluator(cfg, restored, seed)
-        controller = create_controller(cfg, restored, resumed, seed)
+        controller = create_controller(cfg, restored, resumed)
         asyncio.run(
             controller.run_discovery(
                 1, 1, checkpoint_callback=restored.checkpoint, retry_times=1
@@ -433,7 +431,7 @@ def test_completed_evaluation_before_admission_recovers_from_sql_without_generat
         cid = json.loads(payload)["proposal_id"]
         assert cid in restored.admitted
         actual = restored.sql.query_value(
-            "SELECT program_id FROM candidates WHERE id=?", (cid,)
+            "SELECT program_id FROM proposals WHERE id=?", (cid,)
         )
         assert actual != "lost-program-id" and actual in restored.population.programs
     finally:
@@ -443,7 +441,7 @@ def test_completed_evaluation_before_admission_recovers_from_sql_without_generat
 def test_native_migration_preserves_original_candidate_ids(flow):
     cfg, state, seed, evaluator, counts, cache, tmp_path = flow
     cfg["agent"]["backend"] = "codex"
-    controller = create_controller(cfg, state, evaluator, seed)
+    controller = create_controller(cfg, state, evaluator)
     asyncio.run(
         controller.run_discovery(
             1, 8, checkpoint_callback=state.checkpoint, retry_times=1
@@ -468,7 +466,7 @@ def test_cached_evaluation_timeout_cancels_raw_ref_and_preserves_completed_propo
     request = state.reserve(parent, [], kind="search")
     source = json.loads(parent.solution)["source"]
     source[ALLOWLIST[0]] += "// timeout case\n"
-    archive_proposal(state.run, request["id"], source, source, {})
+    state.complete(request["id"], source, {})
 
     @ChiaFunction(resources={"chipyard": 1}, max_retries=0)
     def build(cfg, seed, source):
@@ -476,22 +474,16 @@ def test_cached_evaluation_timeout_cancels_raw_ref_and_preserves_completed_propo
 
     monkeypatch.setattr(tasks, "build", build)
     cfg["runtime"]["task_timeout_seconds"] = 0
-    original_wait, original_cancel = evaluation.chia_wait, evaluation.chia_cancel
+    original_cancel = evaluation.chia_cancel
     cancelled = []
-
-    def wait(refs, **kwargs):
-        return original_wait(refs, **{**kwargs, "timeout": 0.01})
 
     def cancel(ref, **kwargs):
         assert isinstance(ref, ray.ObjectRef)
         cancelled.append(ref)
         return original_cancel(ref, **kwargs)
 
-    monkeypatch.setattr(evaluation, "chia_wait", wait)
     monkeypatch.setattr(evaluation, "chia_cancel", cancel)
     with pytest.raises(TimeoutError, match="CHIA task deadline"):
         evaluator.evaluate(json.dumps({"proposal_id": request["id"], "source": source}))
     assert len(cancelled) == 1 and state.result(request["id"]) is None
-    assert read_json(state.run / "candidates" / request["id"] / "proposal.json")[
-        "source_hash"
-    ] == digest(source)
+    assert state.proposal(request["id"])["source_hash"] == digest(source)

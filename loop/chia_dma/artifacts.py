@@ -1,7 +1,6 @@
-"""One self-contained seed and small immutable two-file proposal archives."""
+"""One self-contained seed, source validation, and atomic run metadata."""
 
 from pathlib import Path
-import difflib
 import fcntl
 import json
 import os
@@ -137,52 +136,6 @@ def validate_integration(bundle, seed_bundle):
 
     if l1_assignments(bundle[name]) != l1_assignments(seed_bundle[name]):
         raise ValueError("The unused L1 interface must remain disabled")
-
-
-def archive_proposal(run, candidate_id, bundle, parent, metadata):
-    validate_bundle(bundle)
-    root = Path(run) / "candidates"
-    root.mkdir(parents=True, exist_ok=True)
-    target = root / candidate_id
-    if (target / "proposal.json").exists():
-        if read_json(target / "proposal.json")["source"] != bundle:
-            raise ValueError("Immutable candidate ID reused")
-        return target
-    temp = root / ("." + candidate_id + "-" + uuid.uuid4().hex)
-    temp.mkdir()
-    patch = []
-    for name, content in bundle.items():
-        p = temp / "rtl" / name
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
-        patch.extend(
-            difflib.unified_diff(
-                parent[name].splitlines(True),
-                content.splitlines(True),
-                fromfile="a/" + name,
-                tofile="b/" + name,
-            )
-        )
-    (temp / "changes.patch").write_text("".join(patch))
-    write_json(
-        temp / "proposal.json",
-        {
-            **metadata,
-            "id": candidate_id,
-            "source": bundle,
-            "source_hash": digest(bundle),
-        },
-    )
-    if target.exists():
-        shutil.copy2(target / "request.json", temp / "request.json")
-        for item in temp.iterdir():
-            item.rename(target / item.name)
-        temp.rmdir()
-        readonly(target)
-    else:
-        readonly(temp)
-        temp.rename(target)
-    return target
 
 
 class RunLock:

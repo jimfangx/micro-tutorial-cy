@@ -1,7 +1,5 @@
 """Ephemeral localhost SSH for testing the real CHIA CLI; all files stay in loop/."""
 
-from pathlib import Path
-import copy
 import os
 import socket
 import subprocess
@@ -65,12 +63,11 @@ LogLevel ERROR
                 )
                 for command in cfg["cluster"][key]
             ]
-        for name in ("cluster", "generation_cluster"):
-            cfg[name]["auth"] = {
-                "ssh_user": os.environ["USER"],
-                "ssh_private_key": str(folder / "client"),
-                "ssh_proxy_command": f"nc 127.0.0.1 {port}",
-            }
+        cfg["cluster"]["auth"] = {
+            "ssh_user": os.environ["USER"],
+            "ssh_private_key": str(folder / "client"),
+            "ssh_proxy_command": f"nc 127.0.0.1 {port}",
+        }
         yield cfg, folder
     finally:
         subprocess.run(

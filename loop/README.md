@@ -1,20 +1,18 @@
-# RoCC DMA discovery with CHIA and SkyDiscover
+# DMA discovery with CHIA and SkyDiscover
 
-Edit [config.yaml](config.yaml), then follow a candidate through
-[search.py](chia_dma/search.py). SkyDiscover's `DiscoveryController` runs the
-search with `search.type: openevolve_native`; CHIA runs the CLI agents, builds,
-and simulations. All tutorial changes and experiment writes stay under `loop/`.
+Edit only [config.yaml](config.yaml). Its comments explain the application,
+worker, and provider settings. Start with [search.py](chia_dma/search.py), then
+[the CLI adapter](chia_dma/adapter.py), [evaluation](chia_dma/evaluation.py), and
+[SQL state](chia_dma/state.py).
 
-The local example requires the initialized Chipyard toolchain, Docker, passwordless
-SSH to the configured worker hosts, and permission to run the configured Docker
-and firewall commands. Set `cluster.auth` in the central configuration; the
-same YAML anchor supplies generation-worker authentication. The bootstrap does
-not change host SSH configuration or credentials.
+Use the initialized local Chipyard/RISC-V environment, Docker, and existing
+passwordless SSH to the configured worker hosts. Bootstrap installs the pinned
+Python projects under `loop/`; its opening comment lists every setup step.
+It does not initialize Chipyard, change SSH keys, or modify host credentials.
 
 ```sh
 source env.sh
 python loop/bootstrap.py
-python loop/loop.py image
 python loop/loop.py prepare --run run-001
 loop/.venv/bin/chia up loop/experiments/run-001/deployment/cluster.yaml -y
 python loop/loop.py doctor --run run-001
@@ -22,121 +20,97 @@ python loop/loop.py run --run run-001
 loop/.venv/bin/chia down loop/experiments/run-001/deployment/cluster.yaml -y
 ```
 
-`prepare` freezes the current local source and renders ordinary CHIA YAML.
-`up` and `down` actions on `loop.py` are conveniences for the same native CLI.
-Build and simulation pools remain up until `chia down`; each generation worker
-is brought up and down around its own proposal. Images, mounts, credentials,
-setup commands, environment, networks, and worker counts live in `config.yaml`.
-Do not edit generated deployment files. Bootstrap applies the two small pinned
-CHIA fixes described in [INTEGRATION.md](INTEGRATION.md).
+`prepare` preserves current local inputs and renders ordinary native CHIA YAML.
+`chia up` pulls pinned upstream build, simulation, and selected CLI images.
+There is no custom image build or CHIA compatibility patch. Read-only mounts
+supply the local Python/JVM/Verilator packages and preserved implementation;
+the image's bundled Chipyard source is not used for compilation. Build workers
+use the image's RISC-V toolchain/libraries and an explicit image C++ compiler;
+simulation uses the matching image disassembler. The C++ override is necessary
+because the local Verilator configuration embeds its original compiler path.
+These settings keep the resulting simulator compatible with the runtime image.
 
-Configure `agent.backend` as `antigravity`, `claude`, or `codex`, with its binary,
-credentials, and options under `agent.backends`. `doctor` makes a real BashTool
-request through that backend. Antigravity requires an authenticated project with
-model access and the Vertex AI API enabled. Claude also mounts its separate
-`.claude.json` configuration. Credentials are copied into a private temporary
-home; project/location overrides never change the host credential files.
+Build, simulation, and generation have independent native resource limits.
+The generation template expands into separate workers with separate two-file
+bind mounts. Each worker has one generation slot, serializing workspace reuse.
+Before invoking the agent, the adapter overwrites both files from the selected
+parent. Native BashTool is pinned to the same worker. Project inputs and
+original source are read-only; evaluator/benchmark files cannot be edited, and
+the proposal database is not mounted in generation. The examples' trusted-agent
+host-network model is used throughout.
 
-## Follow a candidate
+Choose `agent.backend` as `antigravity`, `claude`, or `codex`. Upstream images
+provide Antigravity/Claude binaries; Codex uses two read-only host binary mounts
+on the upstream CHIA base image. Credentials are copied from read-only mounts
+into a private worker home. Antigravity project/location overrides apply only
+when explicitly configured, and only to that copy. `doctor` verifies login and
+BashTool by calculating a checksum inside a generation workspace.
 
-1. Native `sample()` selects the parent and inspirations. A small durable request
-   records that selection and its island before the CLI call.
-2. The [CLI adapter](chia_dma/adapter.py) initializes two writable files from
-   that parent, starts a native CHIA generation worker, and calls the selected
-   CHIA agent with native `BashTool`. Each concurrent proposal has its own worker.
-3. The completed proposal is archived before evaluation. Only the two complete
-   Scala files, lineage, source hash, response, and optional diff are needed.
-4. `ChiselBuildNode` builds the implementation and runs `DMAControllerSpec`.
-   `VerilatorRunNode` fans out all correctness and performance workloads using
-   the shared native build artifact and frozen ELF files.
-5. The frozen DMA parser validates observations and outputs. Native `add()`
-   admits only fully valid candidates, followed by a native population checkpoint.
+To switch providers, first use `chia down` with the existing deployment, edit
+`agent.backend`, run `prepare` again, then use native `chia up` before resuming.
+Saved completed proposals retain their original provider and never require a
+new LLM call.
 
-The controller owns iteration concurrency, result processing, and checkpoint
-callbacks. `search.max_in_flight` bounds candidate pipelines; native CHIA resource
-slots independently bound generation, compilation, and simulation. The small
-population adapter preserves concurrent selections and pins admission to the
-selected island. Native sampling, MAP-Elites, migration, and save/load remain in
-SkyDiscover.
+## Follow one iteration
 
-Generation mounts the fixed source tree read-only, then binds exactly
-`DMAController.scala` and `RoCCDMA.scala` as writable project files. The evaluator,
-benchmarks, historical proposals, other candidates, and Docker socket have no
-writable mount. A separate network and firewall rules deny host services and
-private networks while allowing provider access. BashTool and its private Ray
-service run inside this boundary. Denying a forbidden BashTool write is tested,
-including when two different parents generate concurrently.
+1. SkyDiscover's native `sample()` selects a parent and inspirations; SQL records
+   that context before generation.
+2. A native CHIA generation task initializes its workspace, calls the selected
+   CLI with BashTool, and commits both complete Scala sources and the generation
+   response through CHIA SQLite before returning.
+3. The evaluator loads that SQL proposal and builds one SoC simulator using
+   `ChiselBuildNode`. RTL edits stay in the private build checkout.
+4. Each configured benchmark ELF is submitted independently to
+   `VerilatorRunNode`, sharing the compiled artifact.
+5. The frozen DMA parser validates captured simulator output. DMA-specific
+   workload coverage, activity consistency, measured cycles, and geometric-mean
+   fitness determine the result. Invalid candidates never enter valid archives.
+6. `DiscoveryController` processes results and invokes the checkpoint callback;
+   native `openevolve_native` owns populations, islands, MAP-Elites, and migration.
 
-## Source, state, and recovery
+The loop evaluates only Embench, with benchmark verification and simulator/RTL
+assertions enabled. The seed runs both CPU and DMA modes for an independent
+output comparison; candidates run DMA mode. Fitness is the weighted geometric
+mean of reference/candidate timed-cycle ratios for workloads with timed DMA
+activity. Other Embench workloads remain correctness checks. MAP-Elites uses
+source size and timed DMA bytes per benchmark cycle as its descriptors.
 
-A seed is one self-contained directory at `experiments/seeds/<hash>/tree`, with
-file hashes, Git revision, and a provenance diff alongside it. It includes local
-uncommitted and untracked implementation inputs and retained build dependencies.
-Git object stores and generated outputs are excluded. Inert `.git` marker files
-preserve Chipyard's initialized-generator discovery; they are not repositories.
-Restoration copies this fixed tree and overwrites the two saved Scala files.
-It needs no original checkout, recursive cloning, commits, or patch application.
-The original checkout is never reset or cleaned.
-
-| State | Owner |
-| --- | --- |
-| Population, islands, archives, feature maps, migration | SkyDiscover native checkpoints |
-| Expensive build and simulation results | CHIA cache and bypass |
-| Numerical metrics, workload results, lineage queries | CHIA `SQLiteNode` |
-| Selected requests and completed generations | Small durable candidate archive |
-
-CHIA `get` performs cache callbacks; bypass reads completed build/simulation
-outputs. A cold or evicted cache reruns those tasks. Generation bypass reads the
-immutable proposal archive, so a cache miss cannot repeat a completed LLM call.
-Profiler output and simulator logs remain diagnostics. Software is built once
-and its 43 ELF inputs are frozen and hash checked.
+## Recovery, replay, and forks
 
 ```sh
 python loop/loop.py status --run run-001
 python loop/loop.py resume --run run-001
 python loop/loop.py replay --run run-001 --candidate candidate-<id>
 python loop/loop.py fork --run run-001 \
-  --checkpoint <name-from-checkpoints-directory> --new-run run-001-fork
-python loop/loop.py up --run run-001-fork
-python loop/loop.py resume --run run-001-fork
-python loop/loop.py down --run run-001-fork
+  --checkpoint <checkpoint-directory-name> --new-run run-001-fork
+python loop/loop.py prepare --run run-001-fork
+# Use native chia up for the fork's generated deployment, then resume it.
 ```
 
-Resume recovers the original parent/island selection. A completed generation
-requires no provider login or new LLM call. A completed evaluation interrupted
-before admission is recovered from its numerical record. Invalid candidates
-remain terminal diagnostic records outside valid archives. Native migration
-copies retain the original candidate identity.
+One self-contained `seeds/<hash>/tree` preserves local implementation inputs,
+including relevant uncommitted/untracked files. Git supplies provenance only;
+restoration copies that fixed seed and overwrites the two saved sources. The
+original checkout is never reset or cleaned. No complete checkout is copied per
+candidate, and no recursive Git reconstruction is needed.
 
-Each checkpoint adds only admitted candidate IDs and flags describing which
-requests had completed generation/evaluation at that point. A historical fork
-filters out later proposals and numerical history, including later completions
-of requests that were still pending at the selected checkpoint. Replay creates
-fresh task tags, evaluates exactly the archived source without an LLM call, and
-does not change the population. Backend/model changes apply to new generations;
-evaluation/search settings, worker image identity, parser, and ELF inputs stay frozen.
-Use the matching tutorial implementation when resuming; a seed preserves hardware
-and software inputs rather than a separate executable copy of the search driver.
+`metrics.db` has one authoritative `proposals` row per selection: parent/island,
+source/hash, generation response, and completion/admission linkage. Workload
+measurements live in `benchmarks`. There are no parallel proposal JSON, Scala,
+or patch archives. Files are materialized only in worker workspaces. Numerical
+history repairs evaluations completed just before admission was interrupted.
 
-New runs use **format 3**. Legacy experiment directories are preserved; resuming
-or forking their older checkpoint formats requires their matching previous loop
-implementation. Native checkpoints do not contain pending CLI work or random
-number generator state. Saved pending selections are recovered exactly; future
-stochastic selections are not promised to match an uninterrupted run bit for bit.
+CHIA cache/bypass owns expensive build/simulation reuse; eviction may rerun
+those tasks but cannot regenerate a completed SQL proposal. Native population
+checkpoints carry search state. A small envelope records admitted IDs and which
+SQL completions existed at each checkpoint, allowing historical forks to exclude
+future work. Replay uses fresh task tags and never changes the population.
 
-## Evaluation and validation
+Start a new experiment after changing this loop; there are no checkpoint
+migrations or format-version branches. Resume/fork/replay apply to runs created
+by the current implementation. Native checkpoints do not save RNG state:
+pending selections recover exactly, while future stochastic choices may differ.
 
-Fitness remains the weighted geometric mean of measured DMA speedups relative
-to the seed, with separately normalized Embench and microbenchmark groups.
-Full workload coverage, deterministic outputs, passive hardware observations,
-protocol tests, and unchanged DMA activity gate admission. CPU-only seed runs
-provide an independent comparison. There are no estimated cycle counts.
-
-Defaults allow two candidate pipelines, two generations, one build, and 24
-simulations. Workloads fan out together; resource availability and contention
-still affect elapsed time. The full 2 MiB correctness workload previously took
-about 80 minutes on this host. The refactor's recovery/cache tests use small
-fixture tasks rather than that long simulation.
+## Validation
 
 ```sh
 loop/.venv/bin/python -m pytest -c loop/pytest.ini loop/tests -q
@@ -144,7 +118,7 @@ CHIA_LIVE_AGENTS=1 loop/.venv/bin/python -m pytest -c loop/pytest.ini \
   loop/tests/test_native_cluster.py -q
 ```
 
-The native cluster tests use real Docker/SSH and create temporary SSH fixtures
-under `loop/`. Live provider calls are opt-in. See
-[INTEGRATION.md](INTEGRATION.md) for checkpoint contents, API choices, and the
-scope of validation evidence.
+Orchestration/recovery tests use inexpensive native CHIA tasks and recorded RTL
+observations. Docker/SSH tests exercise real mount permissions and placement;
+provider calls are opt-in. Embench ELFs fan out independently after one simulator
+build. See [INTEGRATION.md](INTEGRATION.md) for validation evidence.

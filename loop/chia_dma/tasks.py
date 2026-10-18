@@ -6,7 +6,6 @@ import subprocess
 from chia.base.ChiaFunction import ChiaFunction
 from chia.chipyard.chisel_build_node import ChiselBuildNode
 from chia.chipyard.verilator_run_node import VerilatorRunNode
-from chia.trace.profiler import get_profiler
 from .artifacts import (
     source_bundle,
     validate_bundle,
@@ -14,16 +13,6 @@ from .artifacts import (
     write_json,
 )
 from .config import digest
-
-
-def event(operation, **info):
-    get_profiler().add_info(info)
-    get_profiler().log_event("dma_" + operation, **info)
-
-
-def workspace(cfg, seed):
-    # Native cluster worker_setup_commands initialize this private checkout once.
-    return Path("/workspace/chipyard")
 
 
 def apply_source(tree, source, baseline):
@@ -35,16 +24,13 @@ def apply_source(tree, source, baseline):
 
 @ChiaFunction(resources={"chipyard": 1}, max_retries=0)
 def software(cfg, run, seed):
-    tree = workspace(cfg, seed)
-    apply_source(
-        tree,
-        source_bundle(Path(seed) / "tree"),
-        source_bundle(Path(seed) / "tree"),
-    )
+    tree = Path("/home/ray/dma-build")
+    baseline = source_bundle(Path(seed) / "tree")
+    apply_source(tree, baseline, baseline)
     for i, command in enumerate(cfg["software"]["build_commands"]):
         with open(Path(run) / f"software-build-{i}.log", "w") as log:
             subprocess.run(
-                [p.replace("{workspace}", str(tree)) for p in command],
+                command,
                 cwd=tree,
                 stdout=log,
                 stderr=subprocess.STDOUT,
@@ -64,7 +50,6 @@ def software(cfg, run, seed):
         for mode in ("cpu", "dma")
         for name in benchmarks
     }
-    paths.update({n: s["elf"] for n, s in cfg["software"]["standalone"].items()})
     workloads = {}
     for name, rel in paths.items():
         p = target / (name.replace(":", "_") + ".elf")
@@ -84,11 +69,10 @@ def software(cfg, run, seed):
 
 @ChiaFunction(resources={"chipyard": 1}, max_retries=0)
 def build(cfg, seed, source):
-    tree = workspace(cfg, seed)
+    tree = Path("/home/ray/dma-build")
     apply_source(tree, source, source_bundle(Path(seed) / "tree"))
     hw = cfg["hardware"]
-    event("build", source_hash=digest(source))
-    artifact = ChiselBuildNode(
+    return ChiselBuildNode(
         str(tree),
         hw["config"],
         config_package=hw["config_package"],
@@ -98,25 +82,10 @@ def build(cfg, seed, source):
         clean=hw["clean"],
         bundle_runtime_libs=True,
     ).build()
-    if artifact.success and hw["protocol_command"]:
-        result = subprocess.run(
-            [a.replace("{workspace}", str(tree)) for a in hw["protocol_command"]],
-            cwd=tree,
-            capture_output=True,
-            text=True,
-            timeout=hw["build_timeout_seconds"],
-        )
-        artifact.stdout += "\nProtocol tests:\n" + result.stdout
-        artifact.stderr += result.stderr
-        if result.returncode or "All tests passed" not in result.stdout:
-            artifact.success = False
-            artifact.returncode = result.returncode or 1
-    return artifact
 
 
 @ChiaFunction(resources={"verilator_run": 1}, max_retries=0)
 def simulate(cfg, artifact, content, name, ini):
-    event("simulation", benchmark=name)
     return VerilatorRunNode().run(
         artifact,
         content,

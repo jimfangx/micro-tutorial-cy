@@ -1,18 +1,63 @@
-"""Native populations, CHIA numerical history, and a small proposal recovery ledger."""
+"""Native populations plus one SQL record per proposal and numerical history."""
 
 from pathlib import Path
 import json
+import shutil
+import sqlite3
 import uuid
+import ray
+from chia.base.ChiaFunction import get
 from chia.database.sqlite_node import SQLiteNode
 from skydiscover.config import OpenEvolveNativeDatabaseConfig
 from skydiscover.search.base_database import Program
 from skydiscover.search.openevolve_native.database import OpenEvolveNativeDatabase
-from .artifacts import read_json, write_json
+from .artifacts import read_json, write_json, validate_bundle
 from .config import digest, frozen
 
 
+def proposal(sql, cid, *, remote=False):
+    query = sql.query_one
+    args = (
+        "SELECT source,source_hash,generation,backend,model FROM proposals WHERE id=?",
+        (cid,),
+    )
+    row = get(query.chia_remote(*args)) if remote else query(*args)
+    if not row or row["source"] is None:
+        return None
+    return {
+        "id": cid,
+        **row,
+        "source": json.loads(row["source"]),
+        "generation": json.loads(row["generation"]),
+    }
+
+
+def complete(sql, cid, source, generation, *, remote=False):
+    """Commit the complete proposal before generation returns; never replace it."""
+    validate_bundle(source)
+    args = (
+        "UPDATE proposals SET source=?,source_hash=?,generation=?,backend=?,model=? WHERE id=? AND source IS NULL",
+        (
+            json.dumps(source),
+            digest(source),
+            json.dumps(generation),
+            generation.get("backend"),
+            generation.get("model"),
+            cid,
+        ),
+    )
+    if remote:
+        get(sql.execute.chia_remote(*args))
+    else:
+        sql.execute(*args)
+    saved = proposal(sql, cid, remote=remote)
+    if saved is None or saved["source"] != source:
+        raise ValueError("Missing request or immutable proposal ID reused")
+    return saved
+
+
 class Population(OpenEvolveNativeDatabase):
-    """Public database adapter: recover original selections and pin admission islands."""
+    """Public sample/add hooks preserve selections and pin admission islands."""
 
     def __init__(self, owner, config):
         self.owner = owner
@@ -26,7 +71,6 @@ class Population(OpenEvolveNativeDatabase):
         else:
             parent, context = super().sample(num_context_programs, **kwargs)
             request = self.owner.reserve(parent, context)
-        # Never mutate a shared parent while concurrent controller tasks use it.
         parent = Program(**parent.to_dict())
         parent.metadata["request_id"] = request["id"]
         return parent, context
@@ -34,10 +78,10 @@ class Population(OpenEvolveNativeDatabase):
     def add(self, program, iteration=None, **kwargs):
         if program.metrics.get("validity") != 1:
             raise ValueError("Only fully valid candidates may enter the population")
-        payload = json.loads(program.solution)
-        cid = payload["proposal_id"]
+        cid = json.loads(program.solution)["proposal_id"]
         request = self.owner.request(cid)
-        program.metadata.update(candidate_id=cid, source_hash=digest(payload["source"]))
+        saved = self.owner.proposal(cid)
+        program.metadata.update(candidate_id=cid, source_hash=saved["source_hash"])
         kwargs.setdefault("target_island", request["island"])
         result = super().add(program, iteration=iteration, **kwargs)
         if (
@@ -45,7 +89,7 @@ class Population(OpenEvolveNativeDatabase):
             and kwargs["target_island"] == request["island"]
         ):
             self.owner.sql.execute(
-                "UPDATE candidates SET program_id=? WHERE id=?", (program.id, cid)
+                "UPDATE proposals SET program_id=? WHERE id=?", (program.id, cid)
             )
         self.owner.admitted.add(cid)
         return result
@@ -73,39 +117,67 @@ class State:
                 raise ValueError("Frozen experiment configuration changed")
             self.population.load(str(cp / "population"))
             self.admitted = set(envelope["admitted"])
-        self.sql = SQLiteNode(str(self.run / "metrics.db"), require_colocated=False)
-        self.sql.init_schema("""CREATE TABLE IF NOT EXISTS candidates
-          (id TEXT PRIMARY KEY,parent TEXT,island INTEGER,sequence INTEGER,backend TEXT,model TEXT,metrics TEXT,program_id TEXT);
+        self.sql = SQLiteNode(
+            str(self.run / "metrics.db"),
+            require_colocated=False,
+            pin_to_current_node=ray.is_initialized(),
+        )
+        self.sql.init_schema("""CREATE TABLE IF NOT EXISTS proposals
+          (id TEXT PRIMARY KEY,parent TEXT,island INTEGER,sequence INTEGER,kind TEXT,
+           request TEXT,source TEXT,source_hash TEXT,generation TEXT,backend TEXT,model TEXT,metrics TEXT,program_id TEXT);
           CREATE TABLE IF NOT EXISTS benchmarks
           (candidate TEXT,name TEXT,metrics TEXT,PRIMARY KEY(candidate,name));""")
         self.recovery = self.pending()
 
     def request(self, cid):
-        return read_json(self.run / "candidates" / cid / "request.json")
+        return json.loads(
+            self.sql.query_value("SELECT request FROM proposals WHERE id=?", (cid,))
+        )
 
     def requests(self):
-        return sorted(
-            (read_json(p) for p in (self.run / "candidates").glob("*/request.json")),
-            key=lambda r: r["sequence"],
-        )
+        return [
+            json.loads(r["request"])
+            for r in self.sql.query("SELECT request FROM proposals ORDER BY sequence")
+        ]
 
     def reserve(self, parent, inspirations, *, cid=None, kind="search"):
         request = {
             "id": cid or "candidate-" + uuid.uuid4().hex,
             "kind": kind,
-            "sequence": max((r["sequence"] for r in self.requests()), default=0) + 1,
+            "sequence": self.sql.query_value(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM proposals"
+            ),
             "parent": parent.to_dict(),
             "inspirations": [p.to_dict() for p in inspirations],
             "island": parent.metadata["island"],
             "backend": self.cfg["agent"]["backend"],
         }
-        write_json(self.run / "candidates" / request["id"] / "request.json", request)
+        self.sql.execute(
+            "INSERT INTO proposals(id,parent,island,sequence,kind,request,backend) VALUES (?,?,?,?,?,?,?)",
+            (
+                request["id"],
+                (
+                    None
+                    if kind == "seed"
+                    else parent.metadata.get("candidate_id", parent.id)
+                ),
+                request["island"],
+                request["sequence"],
+                kind,
+                json.dumps(request),
+                request["backend"],
+            ),
+        )
         return request
 
+    def proposal(self, cid):
+        return proposal(self.sql, cid)
+
+    def complete(self, cid, source, generation):
+        return complete(self.sql, cid, source, generation)
+
     def result(self, cid):
-        value = self.sql.query_value(
-            "SELECT metrics FROM candidates WHERE id=?", (cid,)
-        )
+        value = self.sql.query_value("SELECT metrics FROM proposals WHERE id=?", (cid,))
         return json.loads(value) if value else None
 
     def pending(self):
@@ -118,28 +190,11 @@ class State:
         ]
 
     def record(self, cid, metrics, vector, program_id=""):
-        request = self.request(cid)
-        provenance = read_json(self.run / "candidates" / cid / "proposal.json")
         self.sql.transaction(
             [
                 (
-                    "INSERT OR REPLACE INTO candidates VALUES (?,?,?,?,?,?,?,?)",
-                    (
-                        cid,
-                        (
-                            None
-                            if request["kind"] == "seed"
-                            else request["parent"]["metadata"].get(
-                                "candidate_id", request["parent"]["id"]
-                            )
-                        ),
-                        request["island"],
-                        request["sequence"],
-                        provenance.get("backend", request["backend"]),
-                        provenance.get("model", self.cfg["agent"]["model"]),
-                        json.dumps(metrics),
-                        program_id,
-                    ),
+                    "UPDATE proposals SET metrics=?,program_id=? WHERE id=?",
+                    (json.dumps(metrics), program_id, cid),
                 ),
                 *[
                     (
@@ -160,16 +215,11 @@ class State:
         self.population.save(
             str(temp / "population"), iteration=self.population.last_iteration
         )
-        # These small flags define exactly which proposal/history records existed
-        # at this native checkpoint, including concurrent unfinished generations.
         requests = {
-            r["id"]: {
-                "evaluated": self.result(r["id"]) is not None,
-                "generated": (
-                    self.run / "candidates" / r["id"] / "proposal.json"
-                ).exists(),
-            }
-            for r in self.requests()
+            r["id"]: {"generated": r["generated"], "evaluated": r["evaluated"]}
+            for r in self.sql.query(
+                "SELECT id,source IS NOT NULL AS generated,metrics IS NOT NULL AS evaluated FROM proposals"
+            )
         }
         write_json(
             temp / "state.json",
@@ -189,61 +239,45 @@ class State:
 
 
 def fork(origin, checkpoint, target):
-    """Copy one native checkpoint and only history that existed at that point."""
-    import shutil
-    import sqlite3
-
-    if read_json(origin / "run.json").get("format") != 3:
-        raise ValueError("Use the previous loop revision for legacy checkpoints")
+    """Keep the native population and only SQL history visible at this checkpoint."""
     cp = origin / "checkpoints" / checkpoint
     envelope = read_json(cp / "state.json")
     known = envelope["requests"]
-
-    def ignore(folder, names):
-        folder = Path(folder)
-        if folder == origin:
-            return [
-                n
-                for n in names
-                if n
-                in (
-                    "checkpoints",
-                    "cache",
-                    "artifacts",
-                    "deployment",
-                    "work",
-                    "ray",
-                    ".writer.lock",
-                )
-                or n.startswith("metrics.db")
-            ]
-        if folder == origin / "candidates":
-            return [n for n in names if n not in known]
-        if (
-            folder.parent == origin / "candidates"
-            and not known[folder.name]["generated"]
-        ):
-            return [n for n in names if n != "request.json"]
-        return []
-
-    shutil.copytree(origin, target, ignore=ignore)
+    shutil.copytree(
+        origin,
+        target,
+        ignore=shutil.ignore_patterns(
+            "checkpoints",
+            "cache",
+            "artifacts",
+            "deployment",
+            "work",
+            ".writer.lock",
+            "metrics.db*",
+        ),
+    )
     shutil.copytree(cp, target / "checkpoints" / checkpoint)
-    for cid, flags in known.items():
-        if not flags["generated"]:
-            (target / "candidates" / cid).chmod(0o755)
     with sqlite3.connect(
         "file:" + str(origin / "metrics.db") + "?mode=ro", uri=True
     ) as src, sqlite3.connect(target / "metrics.db") as dst:
         src.backup(dst)
-        keep = [cid for cid, flags in known.items() if flags["evaluated"]]
-        for table, column in [("candidates", "id"), ("benchmarks", "candidate")]:
-            dst.execute(
-                f'DELETE FROM {table} WHERE {column} NOT IN ({",".join("?" for _ in keep)})',
-                keep,
-            )
-        for cid in keep:
+        for row in dst.execute("SELECT id FROM proposals").fetchall():
+            cid = row[0]
+            flags = known.get(cid)
+            if flags is None:
+                dst.execute("DELETE FROM proposals WHERE id=?", (cid,))
+                dst.execute("DELETE FROM benchmarks WHERE candidate=?", (cid,))
+                continue
+            if not flags["generated"]:
+                dst.execute(
+                    "UPDATE proposals SET source=NULL,source_hash=NULL,generation=NULL,model=NULL,backend=json_extract(request,'$.backend') WHERE id=?",
+                    (cid,),
+                )
+            if not flags["evaluated"]:
+                dst.execute("UPDATE proposals SET metrics=NULL WHERE id=?", (cid,))
+                dst.execute("DELETE FROM benchmarks WHERE candidate=?", (cid,))
             if cid not in envelope["admitted"]:
-                dst.execute("UPDATE candidates SET program_id=NULL WHERE id=?", (cid,))
+                dst.execute("UPDATE proposals SET program_id=NULL WHERE id=?", (cid,))
     meta = read_json(target / "run.json")
     meta.update(
         run_id=target.name, forked_from={"run": origin.name, "checkpoint": checkpoint}

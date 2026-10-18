@@ -936,56 +936,5 @@
       "sim_sha256": "5c4507a61c844a15612c821be8fdeab4ecc4d6680cabde408b40f3780e87d104",
       "log_sha256": "cc34fee1681ec2177c17ea2e8054d2c325fd34b0bca10c7c678afc805870d5d1"
     }
-  ],
-  "microbench": [
-    {
-      "bytes": 8,
-      "cpu_cycles": 151,
-      "dma_cycles": 315,
-      "op_cycles": 51,
-      "setup_cycles": 9
-    },
-    {
-      "bytes": 24,
-      "cpu_cycles": 217,
-      "dma_cycles": 137,
-      "op_cycles": 81,
-      "setup_cycles": 9
-    },
-    {
-      "bytes": 64,
-      "cpu_cycles": 534,
-      "dma_cycles": 207,
-      "op_cycles": 151,
-      "setup_cycles": 9
-    },
-    {
-      "bytes": 256,
-      "cpu_cycles": 2070,
-      "dma_cycles": 609,
-      "op_cycles": 553,
-      "setup_cycles": 9
-    },
-    {
-      "bytes": 1024,
-      "cpu_cycles": 8298,
-      "dma_cycles": 2208,
-      "op_cycles": 2152,
-      "setup_cycles": 9
-    },
-    {
-      "bytes": 4096,
-      "cpu_cycles": 33089,
-      "dma_cycles": 8616,
-      "op_cycles": 8560,
-      "setup_cycles": 9
-    },
-    {
-      "bytes": 65536,
-      "cpu_cycles": 583923,
-      "dma_cycles": 120198,
-      "op_cycles": 120142,
-      "setup_cycles": 9
-    }
   ]
 }
