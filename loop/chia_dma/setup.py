@@ -1,74 +1,84 @@
-"""Freeze software once and check authenticated workers before search starts."""
+"""Preserve a seed and configure an experiment before native chia up."""
+
 from pathlib import Path
-import shutil
+import json
 import subprocess
-import tempfile
-from .artifacts import copy_tree, digest, files, read_json, readonly, sync_directory, sync_tree, write_json
-from .containers import agent_mounts, docker, run_worker
-from .tasks import save_files
+import uuid
+from chia.base.ChiaFunction import get
+from .artifacts import git, read_json, snapshot, source_bundle, write_json
+from .config import ROOT, ALLOWLIST, digest, frozen
+from .deployment import render
+from .tasks import software
 
 
-def preflight(cfg):
-    docker(cfg, ['info', '--format', '{{.ServerVersion}}'], capture_output=True)
-    image = docker(cfg, ['image', 'inspect', cfg['runtime']['image'], '--format', '{{.Id}}'], capture_output=True).stdout.strip()
-    Path(cfg['storage'], 'tmp').mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=Path(cfg['storage']) / 'tmp') as folder:
-        folder = Path(folder)
-        mounts = agent_mounts(cfg, folder / 'credentials')
-        if cfg['agent']['authenticate_before_run']:
-            response = run_worker(cfg, 'auth', {'cfg': cfg}, mounts, agent=True)
-            response.pop('_files', None)
-            return {'image_id': image, 'authentication': response}
-    return {'image_id': image, 'authentication': 'disabled by configuration'}
+def image_ids(cfg):
+    nodes = list(cfg["cluster"]["available_node_types"].values()) + list(
+        cfg["generation_cluster"]["available_node_types"].values()
+    )
+    images = {n["docker"]["image"] for n in nodes}
+    return {
+        image: subprocess.check_output(
+            [*cfg["image_inspect"], image], text=True
+        ).strip()
+        for image in images
+    }
+
+
+def prepare(cfg, run):
+    run.mkdir(parents=True, exist_ok=True)
+    images = image_ids(cfg)
+    if (run / "run.json").exists():
+        meta = read_json(run / "run.json")
+        if meta.get("format") != 3:
+            raise ValueError(
+                "Checkpoint format predates the native controller; use its previous loop revision or start a new run"
+            )
+        if meta["frozen_hash"] != digest(frozen(cfg)):
+            raise ValueError("Frozen evaluation/search configuration changed")
+        if meta["image_ids"] != images:
+            raise ValueError("Worker image identity changed")
+    else:
+        seed = snapshot(cfg)
+        meta = {
+            "image_ids": images,
+            "format": 3,
+            "run_id": run.name,
+            "seed": str(seed),
+            "frozen_hash": digest(frozen(cfg)),
+            "loop_revision": git(ROOT, "rev-parse", "HEAD"),
+            "loop_dirty": bool(git(ROOT, "status", "--porcelain", "--", ".")),
+        }
+        write_json(run / "run.json", meta)
+    render(cfg, run, meta["seed"])
+    return meta
+
+
+def authenticate(cfg, run, seed):
+    from .adapter import generate
+
+    task = {
+        "id": "auth-" + uuid.uuid4().hex,
+        "auth": True,
+        "parent": {
+            "solution": json.dumps({"source": source_bundle(Path(seed) / "tree")})
+        },
+        "island": 0,
+        "sequence": 0,
+    }
+    result = get(generate.chia_remote(cfg, str(run), str(seed), task))
+    expected = digest(source_bundle(Path(seed) / "tree")[ALLOWLIST[0]].encode())
+    if expected not in result["response"] or "/workspace" not in result["response"]:
+        raise RuntimeError("CLI authentication/tool probe failed")
 
 
 def prepare_software(cfg, run, seed):
-    target = Path(run) / 'software'
-    if (target / 'manifest.json').exists():
-        manifest = read_json(target / 'manifest.json')
-        for record in manifest['workloads'].values():
-            if digest((target / record['file']).read_bytes()) != record['sha256']:
-                raise ValueError('Frozen software artifact changed')
-        return manifest
-    with tempfile.TemporaryDirectory(dir=Path(cfg['storage']) / 'tmp', prefix='software-') as folder:
-        tree = Path(folder) / 'tree'
-        copy_tree(Path(seed) / 'tree', tree)
-        # Source copy is private; existing tool/build flow can write its outputs.
-        for p in [tree, *tree.rglob('*')]:
-            if not p.is_symlink():
-                p.chmod(p.stat().st_mode | 0o200 | (0o100 if p.is_dir() else 0))
-        before = files(tree)
-        response = run_worker(cfg, 'software', {'cfg': cfg, 'run_id': Path(run).name}, [(str(tree), '/workspace', 'rw')])
-        save_files(Path(run) / 'artifacts' / 'software', response)
-        after = files(tree)
-        # All originally captured files, including benchmark sources, shim,
-        # runtime and build flags, must remain identical during compilation.
-        if any(after.get(name) != record for name, record in before.items()):
-            raise ValueError('Software build altered a frozen input')
-        temp = Path(folder) / 'frozen'
-        temp.mkdir()
-        inventory = sorted(p.name for p in (tree / cfg['software']['benchmark_inventory']).iterdir() if p.is_dir())
-        workloads = {}
-        for mode in ('cpu', 'dma'):
-            for benchmark in inventory:
-                name = f'embench:{mode}:{benchmark}'
-                path = tree / cfg['software']['embench_elf'].format(mode=mode, benchmark=benchmark)
-                dest = name.replace(':', '_') + '.elf'
-                shutil.copyfile(path, temp / dest)
-                workloads[name] = {'file': dest, 'sha256': digest(path.read_bytes())}
-        for name, settings in cfg['software']['standalone'].items():
-            path = tree / settings['elf']
-            dest = name + '.elf'
-            shutil.copyfile(path, temp / dest)
-            workloads[name] = {'file': dest, 'sha256': digest(path.read_bytes())}
-        build_manifest = tree / 'software/rocc-dma/build/embench-manifest.json'
-        shutil.copyfile(build_manifest, temp / 'embench-build.json')
-        manifest = {'benchmarks': inventory, 'workloads': workloads,
-                    'software_hash': digest({k: v for k, v in before.items() if k.startswith(('software/', 'tests/'))}),
-                    'toolchain': response['toolchain']}
-        write_json(temp / 'manifest.json', manifest)
-        sync_tree(temp)
-        temp.rename(target)
-        sync_directory(target.parent)
-        readonly(target)
-        return manifest
+    path = run / "software/manifest.json"
+    manifest = (
+        read_json(path)
+        if path.exists()
+        else get(software.chia_remote(cfg, str(run), str(seed)))
+    )
+    for row in manifest["workloads"].values():
+        if digest((run / "software" / row["file"]).read_bytes()) != row["sha256"]:
+            raise ValueError("Frozen ELF changed")
+    return manifest

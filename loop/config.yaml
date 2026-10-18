@@ -1,41 +1,27 @@
-# All site, agent, search, and evaluation settings live here. Paths are relative
-# to this file; ${HOME} and other environment references are expanded.
+# The only user-edited configuration; cluster sections are native CHIA YAML templates.
 source: ..
 storage: ./experiments
 python: ./.venv/bin/python
-chia: /scratch/jfx/chia-tutorial-chia
+chia: ./.deps/chia
 skydiscover: ./.deps/evolve-flows/skydiscover
 evolve_flows: ./.deps/evolve-flows
 dependencies:
   evolve_flows_url: https://github.com/ucb-bar/evolve-flows.git
   evolve_flows_revision: 62d271304d4675c21b946e327bf542a1f62c1012
+  chia_url: https://github.com/ucb-bar/chia.git
+  chia_revision: a4cedf24b131c459d7f176453d8e0cea97dda796
 runtime:
   conda: ../.conda-env
-  # This session predates the docker group addition; sg activates membership.
-  docker: [sg, docker, -c]
-  image: chia-dma-local:1
-  image_base: ubuntu:24.04
-  cpus_per_build: 8
-  memory: 24g
-  pids_limit: 2048
-  ray_address: null  # null starts a local CHIA/Ray scheduler
-  ray_cpus: 28
-  generation_slots: 2
-  build_slots: 1
-  simulation_slots: 24
+  ray_address: 127.0.0.1:6387
   task_timeout_seconds: 14400
   cache_gb: 4
-  environment:
-    JAVA_TOOL_OPTIONS: -XX:ActiveProcessorCount=8 -Xmx8G -Xss8M -Djava.io.tmpdir=/tmp -Duser.home=/home/ray
-    COURSIER_CACHE: /workspace/.coursier/cache
+  pending_timeout_seconds: 300
 agent:
-  backend: antigravity  # antigravity | claude | codex
-  model: null           # null uses the provider's configured default
+  backend: antigravity
+  model: null
   timeout_seconds: 600
   retries: 1
   authenticate_before_run: true
-  # Every proposal gets a PRIVATE copy of credentials/session files. No agent
-  # receives the experiment archive, Docker socket, or original checkout.
   backends:
     antigravity:
       binary: ${HOME}/.local/bin/agy
@@ -43,12 +29,27 @@ agent:
       credential_target: /home/ray/.gemini
       gcp_project: agy-tutorial
       gcp_location: global
-      options: {extra_cli_args: [--effort, low]}
+      options:
+        extra_cli_args:
+        - --effort
+        - low
+      mounts:
+      - --mount 'type=bind,src=${AGENT_BINARY},dst=/usr/local/bin/agy,readonly'
     claude:
       binary: ${HOME}/.local/bin/claude
       credentials: ${HOME}/.claude
       credential_target: /home/ray/.claude
-      options: {projects_cwd: null}
+      options:
+        projects_cwd: null
+        extra_cli_args:
+        - --tools
+        - ''
+        - --strict-mcp-config
+      mounts:
+      - --mount 'type=bind,src=${AGENT_BINARY},dst=/usr/local/bin/claude,readonly'
+      - --mount 'type=bind,src=${HOME}/.claude.json,dst=/credential-config,readonly'
+      setup_commands:
+      - cp /credential-config /home/ray/.claude.json
     codex:
       binary: ${HOME}/.local/bin/codex
       extra_binaries:
@@ -56,6 +57,9 @@ agent:
       credentials: ${HOME}/.codex
       credential_target: /home/ray/.codex
       options: {}
+      mounts:
+      - --mount 'type=bind,src=${AGENT_BINARY},dst=/usr/local/bin/codex,readonly'
+      - --mount 'type=bind,src=${HOME}/.codex/packages/standalone/current/bin/codex-code-mode-host,dst=/usr/local/bin/codex-code-mode-host,readonly'
 search:
   iterations: 2
   random_seed: 42
@@ -63,7 +67,9 @@ search:
   num_islands: 2
   population_size: 40
   archive_size: 100
-  feature_dimensions: [source_bytes, large_copy_bandwidth]
+  feature_dimensions:
+  - source_bytes
+  - large_copy_bandwidth
   feature_bins: 8
   exploration_ratio: 0.2
   exploitation_ratio: 0.7
@@ -71,44 +77,72 @@ search:
   migration_interval: 2
   migration_rate: 0.1
   island_guidance:
-    - Reduce small-copy latency and setup overhead.
-    - Increase large-copy throughput and overlap accelerator-local requests.
+  - Reduce small-copy latency and setup overhead.
+  - Increase large-copy throughput and overlap accelerator-local requests.
+  max_in_flight: 2
+  type: openevolve_native
 hardware:
   config: DMARocketConfig
   config_package: chipyard
   allowlist:
-    - generators/chipyard/src/main/scala/dma/DMAController.scala
-    - generators/chipyard/src/main/scala/dma/RoCCDMA.scala
+  - generators/chipyard/src/main/scala/dma/DMAController.scala
+  - generators/chipyard/src/main/scala/dma/RoCCDMA.scala
   make_jobs: 8
   build_timeout_seconds: 3600
-  protocol_command: [java, -Xmx8G, -jar, scripts/sbt-launch.jar,
-    -Dsbt.ivy.home=/workspace/.ivy2, -Dsbt.global.base=/workspace/.sbt,
-    -Dsbt.boot.directory=/workspace/.sbt/boot, "chipyard/testOnly chipyard.dma.DMAControllerSpec"]
-  extra_make_args: {JAVA_HEAP_SIZE: 8G}
+  protocol_command:
+  - java
+  - -Xmx8G
+  - -jar
+  - scripts/sbt-launch.jar
+  - -Dsbt.ivy.home={workspace}/.ivy2
+  - -Dsbt.global.base={workspace}/.sbt
+  - -Dsbt.boot.directory={workspace}/.sbt/boot
+  - chipyard/testOnly chipyard.dma.DMAControllerSpec
+  extra_make_args:
+    JAVA_HEAP_SIZE: 8G
+  clean: false
 software:
   metrics_parser: software/rocc-dma/scripts/metrics.py
-  # Freeze the existing build flow once per experiment, before generating RTL.
   build_commands:
-    - [make, -C, software/rocc-dma, libraries,
-       "{workspace}/software/rocc-dma/build/command-smoke.riscv",
-       "{workspace}/software/rocc-dma/build/correctness.riscv",
-       "{workspace}/software/rocc-dma/build/wrapper-dma.riscv",
-       "{workspace}/software/rocc-dma/build/wrapper-cpu.riscv",
-       "{workspace}/software/rocc-dma/build/microbench.riscv"]
-    - [python, software/rocc-dma/scripts/embench.py, build, --modes, cpu, dma]
+  - - make
+    - -C
+    - software/rocc-dma
+    - libraries
+    - '{workspace}/software/rocc-dma/build/command-smoke.riscv'
+    - '{workspace}/software/rocc-dma/build/correctness.riscv'
+    - '{workspace}/software/rocc-dma/build/wrapper-dma.riscv'
+    - '{workspace}/software/rocc-dma/build/wrapper-cpu.riscv'
+    - '{workspace}/software/rocc-dma/build/microbench.riscv'
+  - - python
+    - software/rocc-dma/scripts/embench.py
+    - build
+    - --modes
+    - cpu
+    - dma
   benchmark_inventory: tests/embench-iot/src
   embench_elf: software/rocc-dma/build/embench-{mode}/src/{benchmark}/{benchmark}
   standalone:
-    command-smoke: {elf: software/rocc-dma/build/command-smoke.riscv, marker: DMA command smoke PASS}
-    correctness: {elf: software/rocc-dma/build/correctness.riscv, marker: DMA correctness/coherence PASS}
-    wrapper-dma: {elf: software/rocc-dma/build/wrapper-dma.riscv, marker: DMA wrapper PASS}
-    wrapper-cpu: {elf: software/rocc-dma/build/wrapper-cpu.riscv, marker: DMA wrapper PASS}
-    microbench: {elf: software/rocc-dma/build/microbench.riscv, marker: DMA microbenchmark PASS}
+    command-smoke:
+      elf: software/rocc-dma/build/command-smoke.riscv
+      marker: DMA command smoke PASS
+    correctness:
+      elf: software/rocc-dma/build/correctness.riscv
+      marker: DMA correctness/coherence PASS
+    wrapper-dma:
+      elf: software/rocc-dma/build/wrapper-dma.riscv
+      marker: DMA wrapper PASS
+    wrapper-cpu:
+      elf: software/rocc-dma/build/wrapper-cpu.riscv
+      marker: DMA wrapper PASS
+    microbench:
+      elf: software/rocc-dma/build/microbench.riscv
+      marker: DMA microbenchmark PASS
   dram_ini: generators/testchipip/src/main/resources/dramsim2_ini
   random_seed: 42
-  plusargs: {"+cycle-count": "", "+loadmem": "/test.elf"}
+  plusargs:
+    +cycle-count: ''
+    +loadmem: /test.elf
   timeout_cycles: 1000000000
-  # Full 2 MiB coherence verification takes about 80 minutes on this host.
   timeout_seconds: 10800
 fitness:
   embench_weight: 1.0
@@ -117,8 +151,188 @@ fitness:
   require_activity_match: true
   max_area: null
   max_delay: null
-snapshot:
-  # Excludes generated products, never source files. Submodule contents are
-  # captured as files, with revisions/dirty patches in the seed manifest.
-  exclude_dirs: [.git, .conda-env, loop, loop_context, target, generated-src, output, __pycache__, .bloop, .bsp, .metals, node_modules]
-  exclude_paths: [software/rocc-dma/build, .java_tmp]
+cache:
+  build: true
+  simulate: true
+bypass:
+  generate: true
+  build: true
+  simulate: true
+preserve:
+  exclude_dirs:
+  - .git
+  - loop
+  - loop_context
+  - .conda-env
+  - .venv
+  - __pycache__
+  - .pytest_cache
+  - target
+  exclude_paths:
+  - software/rocc-dma/build
+  - sims/verilator/generated-src
+  - sims/verilator/output
+  - sims/firesim/platforms/f1/aws-fpga/SDAccel/examples
+  - software/firemarshal/boards/default/linux
+image_build:
+- sudo
+- docker
+- build
+- --build-arg
+- CONDA_ROOT=${CONDA}
+- --build-arg
+- WORKER_UID=${UID}
+- -t
+- chia-dma-tutorial:3
+- -f
+- ${LOOP}/Dockerfile
+- ${LOOP}
+cluster:
+  cluster_name: dma-${NAME}
+  provider:
+    head_ip: 127.0.0.1
+  auth: &id002
+    ssh_user: ${USER}
+    ssh_private_key: ${HOME}/.ssh/id_ed25519
+  head_env_commands: &id003
+  - export PATH=${CONDA}/bin:${CONDA}/riscv-tools/bin:/usr/local/bin:/usr/bin:/bin
+  - export PYTHONPATH=${LOOP}:${CHIA}:${LOOP}/.deps/evolve-flows:${LOOP}/.deps/evolve-flows/skydiscover
+  head_start_ray_commands:
+  - ray start --head --node-ip-address=127.0.0.1 --port=6387 --num-cpus=4 --resources='{"generation":2}'
+    --dashboard-host=127.0.0.1 --dashboard-port=8287 --temp-dir=/tmp/ray/dma-${NAME}
+  worker_start_ray_commands:
+  - ray start --address=$RAY_HEAD_IP:6387 --num-cpus=24 --dashboard-agent-listen-port=0
+  available_node_types:
+    build:
+      resources:
+        chipyard: 1
+      num_workers: 1
+      compatible_ips:
+      - 127.0.0.1
+      worker_env_commands: &id001
+      - export PATH=${CONDA}/bin:${CONDA}/riscv-tools/bin:/usr/local/bin:/usr/bin:/bin
+      - export PYTHONPATH=/opt/loop:/opt/loop/.deps/chia
+      worker_setup_commands:
+      - mkdir -p /workspace/chipyard
+      - cp -a ${SEED}/tree/. /workspace/chipyard/
+      - chmod -R u+w /workspace/chipyard
+      docker:
+        image: chia-dma-tutorial:3
+        container_name: dma-${NAME}-build
+        pull_before_run: false
+        run_options:
+        - --shm-size=2g
+        - --ulimit nofile=65536:65536
+        - --mount 'type=bind,src=${CONDA},dst=${CONDA},readonly'
+        - --mount 'type=bind,src=${LOOP},dst=/opt/loop,readonly'
+        - --mount 'type=bind,src=${RUN},dst=${RUN}'
+        - --mount 'type=bind,src=${SEED},dst=${SEED},readonly'
+        - --env RISCV=${CONDA}/riscv-tools
+        - --env 'JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=8 -Xmx8G -Xss8M -Djava.io.tmpdir=/tmp
+          -Duser.home=/home/ray'
+        - --env COURSIER_CACHE=/workspace/chipyard/.coursier/cache
+    simulation:
+      resources:
+        verilator_run: 24
+      num_workers: 1
+      compatible_ips:
+      - 127.0.0.1
+      worker_env_commands: *id001
+      docker:
+        image: chia-dma-tutorial:3
+        container_name: dma-${NAME}-simulation
+        pull_before_run: false
+        run_options:
+        - --shm-size=2g
+        - --ulimit nofile=65536:65536
+        - --mount 'type=bind,src=${CONDA},dst=${CONDA},readonly'
+        - --mount 'type=bind,src=${LOOP},dst=/opt/loop,readonly'
+        - --mount 'type=bind,src=${RUN},dst=${RUN}'
+        - --mount 'type=bind,src=${SEED},dst=${SEED},readonly'
+generation_cluster:
+  scoped_teardown: false
+  cluster_name: dma-${NAME}-${CID}
+  provider:
+    head_ip: 127.0.0.1
+  auth: *id002
+  head_env_commands: *id003
+  head_start_ray_commands: []
+  worker_start_ray_commands: []
+  available_node_types:
+    generation:
+      resources:
+        generation: 1
+      num_workers: 1
+      compatible_ips:
+      - 127.0.0.1
+      worker_env_commands:
+      - export PYTHONPATH=/opt/loop:/opt/chia
+      worker_setup_commands:
+      - mkdir -p ${CREDENTIAL_TARGET}
+      - rsync -a --exclude conversations --exclude sessions --exclude projects --exclude
+        logs --exclude "*.log" --exclude tmp --exclude history.jsonl --exclude shell_snapshots
+        --exclude "*.sock" --exclude app-server-control --exclude app-server-daemon
+        /credentials/ ${CREDENTIAL_TARGET}/
+      docker:
+        image: chia-dma-tutorial:3
+        container_name: dma-${NAME}-${CID}
+        pull_before_run: false
+        run_options:
+        - --network=${NETWORK}
+        - --shm-size=256m
+        - --read-only
+        - --cap-drop=ALL
+        - --security-opt=no-new-privileges
+        - --pids-limit=2048
+        - --memory=24g
+        - --cpus=8
+        - --tmpfs /tmp:rw,exec,mode=1777
+        - --tmpfs /home/ray:rw,exec,mode=1777
+        - --user ${UID}:${GID}
+        - --mount 'type=bind,src=${CONDA},dst=${CONDA},readonly'
+        - --mount 'type=bind,src=${CHIA},dst=/opt/chia,readonly'
+        - --mount 'type=bind,src=${LOOP}/chia_dma,dst=/opt/loop/chia_dma,readonly'
+        - --mount 'type=bind,src=${SEED}/tree,dst=/workspace,readonly'
+        - --mount 'type=bind,src=${WORK}/DMAController.scala,dst=/workspace/generators/chipyard/src/main/scala/dma/DMAController.scala'
+        - --mount 'type=bind,src=${WORK}/RoCCDMA.scala,dst=/workspace/generators/chipyard/src/main/scala/dma/RoCCDMA.scala'
+        - --mount 'type=bind,src=${CREDENTIALS},dst=/credentials,readonly'
+        - --env PYTHONPATH=/opt/loop:/opt/chia
+  head_setup_commands:
+  - sudo docker network inspect ${NETWORK} >/dev/null 2>&1 || sudo docker network
+    create --opt com.docker.network.bridge.name=${BRIDGE} --opt com.docker.network.bridge.enable_icc=false
+    ${NETWORK}
+  - sudo iptables -C INPUT -i ${BRIDGE} -j REJECT 2>/dev/null || sudo iptables -I
+    INPUT 1 -i ${BRIDGE} -j REJECT
+  - for subnet in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10;
+    do sudo iptables -C DOCKER-USER -i ${BRIDGE} -d "$subnet" -j REJECT 2>/dev/null
+    || sudo iptables -I DOCKER-USER 1 -i ${BRIDGE} -d "$subnet" -j REJECT; done
+  head_teardown_commands:
+  - sudo docker network rm ${NETWORK} >/dev/null 2>&1 || true
+  - sudo iptables -D INPUT -i ${BRIDGE} -j REJECT 2>/dev/null || true
+  - for subnet in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10;
+    do sudo iptables -D DOCKER-USER -i ${BRIDGE} -d "$subnet" -j REJECT 2>/dev/null
+    || true; done
+generation_exec:
+- sudo
+- docker
+- exec
+- -i
+- ${CONTAINER}
+- env
+- PYTHONPATH=/opt/loop:/opt/chia
+- ${CONDA}/bin/python
+- -m
+- chia_dma.agents
+image_inspect:
+- sudo
+- docker
+- image
+- inspect
+- --format
+- '{{.Id}}'
+generation_ray:
+  num_cpus: 2
+  include_dashboard: false
+  object_store_memory: 83886080
+  _node_ip_address: 127.0.0.1
+  logging_level: ERROR

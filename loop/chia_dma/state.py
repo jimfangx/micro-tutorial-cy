@@ -1,142 +1,252 @@
-"""CHIA SQLite metadata + native OpenEvolve checkpoints, atomically published."""
+"""Native populations, CHIA numerical history, and a small proposal recovery ledger."""
+
 from pathlib import Path
 import json
-import random
-import shutil
 import uuid
 from chia.database.sqlite_node import SQLiteNode
 from skydiscover.config import OpenEvolveNativeDatabaseConfig
+from skydiscover.search.base_database import Program
 from skydiscover.search.openevolve_native.database import OpenEvolveNativeDatabase
-from .artifacts import archive_proposal, readonly, read_json, sync_directory, sync_tree, write_json
+from .artifacts import read_json, write_json
 from .config import digest, frozen
 
-SCHEMA = '''
-CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, config TEXT NOT NULL, seed TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS candidates
- (id TEXT PRIMARY KEY, parent TEXT, island INTEGER, iteration INTEGER, source_hash TEXT,
-  proposal TEXT, backend TEXT, model TEXT, status TEXT, metrics TEXT);
-CREATE TABLE IF NOT EXISTS stages
- (candidate TEXT, stage TEXT, record TEXT NOT NULL, PRIMARY KEY(candidate,stage));
-CREATE TABLE IF NOT EXISTS benchmarks
- (candidate TEXT, name TEXT, metrics TEXT NOT NULL, PRIMARY KEY(candidate,name));
-CREATE TABLE IF NOT EXISTS checkpoints
- (id TEXT PRIMARY KEY, stage TEXT NOT NULL, path TEXT NOT NULL);
-'''
 
+class Population(OpenEvolveNativeDatabase):
+    """Public database adapter: recover original selections and pin admission islands."""
 
-def tuples(value):
-    return tuple(tuples(v) for v in value) if isinstance(value, list) else value
+    def __init__(self, owner, config):
+        self.owner = owner
+        super().__init__("openevolve_native", config)
+
+    def sample(self, num_context_programs=4, **kwargs):
+        if self.owner.recovery:
+            request = self.owner.recovery.pop(0)
+            parent = Program(**request["parent"])
+            context = [Program(**p) for p in request["inspirations"]]
+        else:
+            parent, context = super().sample(num_context_programs, **kwargs)
+            request = self.owner.reserve(parent, context)
+        # Never mutate a shared parent while concurrent controller tasks use it.
+        parent = Program(**parent.to_dict())
+        parent.metadata["request_id"] = request["id"]
+        return parent, context
+
+    def add(self, program, iteration=None, **kwargs):
+        if program.metrics.get("validity") != 1:
+            raise ValueError("Only fully valid candidates may enter the population")
+        payload = json.loads(program.solution)
+        cid = payload["proposal_id"]
+        request = self.owner.request(cid)
+        program.metadata.update(candidate_id=cid, source_hash=digest(payload["source"]))
+        kwargs.setdefault("target_island", request["island"])
+        result = super().add(program, iteration=iteration, **kwargs)
+        if (
+            not kwargs.get("_is_migration")
+            and kwargs["target_island"] == request["island"]
+        ):
+            self.owner.sql.execute(
+                "UPDATE candidates SET program_id=? WHERE id=?", (program.id, cid)
+            )
+        self.owner.admitted.add(cid)
+        return result
 
 
 class State:
-    def __init__(self, cfg, run, *, restore=True):
+    def __init__(self, cfg, run):
         self.cfg, self.run = cfg, Path(run)
         self.run.mkdir(parents=True, exist_ok=True)
-        self.sql = SQLiteNode(str(self.run / 'metrics.db'), require_colocated=False,
-                              connect_opts={'synchronous': 'FULL'})
-        self.sql.init_schema(SCHEMA)
-        search = cfg['search']
-        valid = OpenEvolveNativeDatabaseConfig.__dataclass_fields__
-        config = OpenEvolveNativeDatabaseConfig(**{k: v for k, v in search.items() if k in valid})
-        # All persistence goes through complete checkpoint directories, avoiding
-        # native add()'s non-atomic autosaves into a live population directory.
+        self.admitted = set()
+        fields = OpenEvolveNativeDatabaseConfig.__dataclass_fields__
+        config = OpenEvolveNativeDatabaseConfig(
+            **{k: v for k, v in cfg["search"].items() if k in fields}
+        )
         config.db_path = None
-        self.population = OpenEvolveNativeDatabase('rocc_dma', config)
-        self.tasks = {}
-        self.sequence = 0
-        self.next_iteration = 1
-        if restore and (self.run / 'latest.json').exists():
-            self.restore(read_json(self.run / 'latest.json')['checkpoint'])
-        else:
-            random.seed(search['random_seed'])
+        self.population = Population(self, config)
+        if (self.run / "latest.json").exists():
+            cp = (
+                self.run
+                / "checkpoints"
+                / read_json(self.run / "latest.json")["checkpoint"]
+            )
+            envelope = read_json(cp / "state.json")
+            if envelope["frozen_hash"] != digest(frozen(cfg)):
+                raise ValueError("Frozen experiment configuration changed")
+            self.population.load(str(cp / "population"))
+            self.admitted = set(envelope["admitted"])
+        self.sql = SQLiteNode(str(self.run / "metrics.db"), require_colocated=False)
+        self.sql.init_schema("""CREATE TABLE IF NOT EXISTS candidates
+          (id TEXT PRIMARY KEY,parent TEXT,island INTEGER,sequence INTEGER,backend TEXT,model TEXT,metrics TEXT,program_id TEXT);
+          CREATE TABLE IF NOT EXISTS benchmarks
+          (candidate TEXT,name TEXT,metrics TEXT,PRIMARY KEY(candidate,name));""")
+        self.recovery = self.pending()
 
-    def restore(self, checkpoint):
-        checkpoint = self.run / 'checkpoints' / checkpoint
-        state = read_json(checkpoint / 'state.json')
-        if state['frozen_hash'] != digest(frozen(self.cfg)):
-            raise ValueError('Frozen evaluation/search configuration changed; use a new experiment')
-        if (checkpoint / 'metrics.db').exists():
-            self.sql.wal_checkpoint()
-            shutil.copyfile(checkpoint / 'metrics.db', self.run / 'metrics.db')
-        self.population.load(str(checkpoint / 'population'))
-        self.tasks = state['tasks']
-        self.sequence = state['sequence']
-        self.next_iteration = state['next_iteration']
-        random.setstate(tuples(state['random_state']))
-        self.sql.execute('INSERT OR REPLACE INTO checkpoints VALUES (?,?,?)',
-                         (checkpoint.name, checkpoint.name.split('-', 1)[1], str(checkpoint)))
+    def request(self, cid):
+        return read_json(self.run / "candidates" / cid / "request.json")
 
-    def checkpoint(self, stage):
-        # Native migration/empty-island seeding may create equivalent programs.
-        # Link those native IDs to immutable sources without another LLM call.
-        for program in self.population.programs.values():
-            bundle = json.loads(program.solution)
-            proposal = self.run / 'candidates' / program.id / 'proposal.json'
-            if not proposal.exists():
-                archive_proposal(self.run, program.id, bundle, bundle,
-                                 {'id': program.id, 'parent_id': program.parent_id,
-                                  'island': program.metadata.get('island', 0),
-                                  'iteration': program.iteration_found, 'native_copy': True})
-            self.sql.execute('''INSERT OR IGNORE INTO candidates
-                (id,parent,island,iteration,source_hash,proposal,status,metrics)
-                VALUES (?,?,?,?,?,?,?,?)''',
-                (program.id, program.parent_id, program.metadata.get('island', 0),
-                 program.iteration_found, digest(bundle), str(proposal.parent),
-                 'updated', json.dumps(program.metrics)))
-        self.sequence += 1
-        name = f'{self.sequence:08d}-{stage}'
-        root = self.run / 'checkpoints'
+    def requests(self):
+        return sorted(
+            (read_json(p) for p in (self.run / "candidates").glob("*/request.json")),
+            key=lambda r: r["sequence"],
+        )
+
+    def reserve(self, parent, inspirations, *, cid=None, kind="search"):
+        request = {
+            "id": cid or "candidate-" + uuid.uuid4().hex,
+            "kind": kind,
+            "sequence": max((r["sequence"] for r in self.requests()), default=0) + 1,
+            "parent": parent.to_dict(),
+            "inspirations": [p.to_dict() for p in inspirations],
+            "island": parent.metadata["island"],
+            "backend": self.cfg["agent"]["backend"],
+        }
+        write_json(self.run / "candidates" / request["id"] / "request.json", request)
+        return request
+
+    def result(self, cid):
+        value = self.sql.query_value(
+            "SELECT metrics FROM candidates WHERE id=?", (cid,)
+        )
+        return json.loads(value) if value else None
+
+    def pending(self):
+        return [
+            r
+            for r in self.requests()
+            if r["kind"] == "search"
+            and r["id"] not in self.admitted
+            and (self.result(r["id"]) or {}).get("validity") != 0
+        ]
+
+    def record(self, cid, metrics, vector, program_id=""):
+        request = self.request(cid)
+        provenance = read_json(self.run / "candidates" / cid / "proposal.json")
+        self.sql.transaction(
+            [
+                (
+                    "INSERT OR REPLACE INTO candidates VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        cid,
+                        (
+                            None
+                            if request["kind"] == "seed"
+                            else request["parent"]["metadata"].get(
+                                "candidate_id", request["parent"]["id"]
+                            )
+                        ),
+                        request["island"],
+                        request["sequence"],
+                        provenance.get("backend", request["backend"]),
+                        provenance.get("model", self.cfg["agent"]["model"]),
+                        json.dumps(metrics),
+                        program_id,
+                    ),
+                ),
+                *[
+                    (
+                        "INSERT OR REPLACE INTO benchmarks VALUES (?,?,?)",
+                        (cid, name, json.dumps(row)),
+                    )
+                    for name, row in vector.items()
+                ],
+            ]
+        )
+
+    def checkpoint(self, iteration=0):
+        root = self.run / "checkpoints"
         root.mkdir(exist_ok=True)
-        temp = root / ('.' + uuid.uuid4().hex)
+        name = f"{iteration:08d}-" + uuid.uuid4().hex[:8]
+        temp = root / ("." + name)
         temp.mkdir()
-        self.population.save(str(temp / 'population'), iteration=self.population.last_iteration)
-        write_json(temp / 'state.json', {
-            'sequence': self.sequence, 'tasks': self.tasks, 'next_iteration': self.next_iteration,
-            'random_state': random.getstate(), 'frozen_hash': digest(frozen(self.cfg)),
-            'population_iteration': self.population.last_iteration})
-        # CHIA's WAL API supplies the database snapshot; native save() supplies
-        # population serialization. Neither depends on the LRU output cache.
-        if self.sql.wal_checkpoint()['busy']:
-            raise RuntimeError('Cannot checkpoint SQLite while a writer is active')
-        shutil.copyfile(self.run / 'metrics.db', temp / 'metrics.db')
-        sync_tree(temp)
-        final = root / name
-        temp.rename(final)
-        sync_directory(root)
-        readonly(final)
-        self.sql.execute('INSERT OR REPLACE INTO checkpoints VALUES (?,?,?)', (name, stage, str(final)))
-        write_json(self.run / 'latest.json', {'checkpoint': name})
+        self.population.save(
+            str(temp / "population"), iteration=self.population.last_iteration
+        )
+        # These small flags define exactly which proposal/history records existed
+        # at this native checkpoint, including concurrent unfinished generations.
+        requests = {
+            r["id"]: {
+                "evaluated": self.result(r["id"]) is not None,
+                "generated": (
+                    self.run / "candidates" / r["id"] / "proposal.json"
+                ).exists(),
+            }
+            for r in self.requests()
+        }
+        write_json(
+            temp / "state.json",
+            {
+                "frozen_hash": digest(frozen(self.cfg)),
+                "admitted": sorted(self.admitted),
+                "requests": requests,
+            },
+        )
+        temp.rename(root / name)
+        write_json(self.run / "latest.json", {"checkpoint": name})
         return name
-
-    def stage(self, task, stage, record=None):
-        record = record or {}
-        self.sql.transaction([
-            ('INSERT OR REPLACE INTO stages VALUES (?,?,?)', (task['id'], stage, json.dumps(record))),
-            ('''INSERT INTO candidates(id,parent,island,iteration,status,backend,model)
-                VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status''',
-             (task['id'], task.get('parent_id'), task.get('island', 0), task.get('iteration', 0), stage,
-              task.get('backend', self.cfg['agent']['backend']), task.get('model', self.cfg['agent']['model'])))])
-        if stage == 'proposed':
-            proposal = self.run / 'candidates' / task['id'] / 'proposal.json'
-            data = read_json(proposal)
-            self.sql.execute('UPDATE candidates SET source_hash=?,proposal=? WHERE id=?',
-                             (data['source_hash'], str(proposal.parent), task['id']))
-        task['stage'] = stage
-        self.checkpoint(stage)
-
-    def evaluated(self, task, metrics, vector):
-        proposal = read_json(self.run / 'candidates' / task['id'] / 'proposal.json')
-        statements = [(
-            '''UPDATE candidates SET source_hash=?, proposal=?, metrics=?, status='evaluated',
-                backend=?,model=? WHERE id=?''',
-            (proposal['source_hash'], str(self.run / 'candidates' / task['id']), json.dumps(metrics),
-             proposal.get('backend'), proposal.get('model'), task['id']))]
-        for name, row in vector.items():
-            statements.append(('INSERT OR REPLACE INTO benchmarks VALUES (?,?,?)', (task['id'], name, json.dumps(row))))
-        self.sql.transaction(statements)
-        task['metrics'], task['vector'] = metrics, vector
-        self.stage(task, 'evaluated', metrics)
 
     def close(self):
         self.sql.wal_checkpoint()
         self.sql.close()
+
+
+def fork(origin, checkpoint, target):
+    """Copy one native checkpoint and only history that existed at that point."""
+    import shutil
+    import sqlite3
+
+    if read_json(origin / "run.json").get("format") != 3:
+        raise ValueError("Use the previous loop revision for legacy checkpoints")
+    cp = origin / "checkpoints" / checkpoint
+    envelope = read_json(cp / "state.json")
+    known = envelope["requests"]
+
+    def ignore(folder, names):
+        folder = Path(folder)
+        if folder == origin:
+            return [
+                n
+                for n in names
+                if n
+                in (
+                    "checkpoints",
+                    "cache",
+                    "artifacts",
+                    "deployment",
+                    "work",
+                    "ray",
+                    ".writer.lock",
+                )
+                or n.startswith("metrics.db")
+            ]
+        if folder == origin / "candidates":
+            return [n for n in names if n not in known]
+        if (
+            folder.parent == origin / "candidates"
+            and not known[folder.name]["generated"]
+        ):
+            return [n for n in names if n != "request.json"]
+        return []
+
+    shutil.copytree(origin, target, ignore=ignore)
+    shutil.copytree(cp, target / "checkpoints" / checkpoint)
+    for cid, flags in known.items():
+        if not flags["generated"]:
+            (target / "candidates" / cid).chmod(0o755)
+    with sqlite3.connect(
+        "file:" + str(origin / "metrics.db") + "?mode=ro", uri=True
+    ) as src, sqlite3.connect(target / "metrics.db") as dst:
+        src.backup(dst)
+        keep = [cid for cid, flags in known.items() if flags["evaluated"]]
+        for table, column in [("candidates", "id"), ("benchmarks", "candidate")]:
+            dst.execute(
+                f'DELETE FROM {table} WHERE {column} NOT IN ({",".join("?" for _ in keep)})',
+                keep,
+            )
+        for cid in keep:
+            if cid not in envelope["admitted"]:
+                dst.execute("UPDATE candidates SET program_id=NULL WHERE id=?", (cid,))
+    meta = read_json(target / "run.json")
+    meta.update(
+        run_id=target.name, forked_from={"run": origin.name, "checkpoint": checkpoint}
+    )
+    write_json(target / "run.json", meta)
+    write_json(target / "latest.json", {"checkpoint": checkpoint})

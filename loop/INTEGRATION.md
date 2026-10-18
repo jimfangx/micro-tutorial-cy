@@ -1,84 +1,158 @@
-# Inspected APIs and integration decisions
+# Integration decisions and validation
 
-Inspected local sources, rather than assuming CLI agents work through an
-OpenAI-compatible API:
+The tutorial pins CHIA `a4cedf24`, evolve-flows `62d27130`, and its SkyDiscover
+submodule `78833ea6`. The inspected upstream
+[memcpy helpers](https://github.com/ucb-bar/chia/blob/a4cedf24b131c459d7f176453d8e0cea97dda796/examples/memcpy/helpers.py)
+reset a worker checkout and collect diffs; this tutorial instead preserves one
+complete source seed. The
+[gem5 alignment example](https://github.com/ucb-bar/chia/tree/a4cedf24b131c459d7f176453d8e0cea97dda796/examples/gem5_align)
+provides SQLite and source-state examples, while CHIA cache/bypass supplies task
+output reuse. Neither replaces evolutionary checkpoints or pending proposals.
 
-| Existing component | Reused API / finding |
+| Responsibility | Reused API |
 | --- | --- |
-| CHIA `a4cedf24` (local checkout) | `AntigravityLLM.prompt(message, tools)`, `ClaudeCodeLLM.prompt`, `CodexLLM.prompt`; local methods run inside the per-proposal sandbox. |
-| CHIA container lifecycle | `chia.cluster.docker.DockerManager.setup_container/exec_command/stop_container`; its SSH-shaped transport is adapted to local subprocesses. Task containers use bridge networking and restricted mounts. |
-| CHIA scheduling | `ChiaFunction` resource labels independently bound generation, build, and simulation. |
-| CHIA RTL nodes | `ChiselBuildNode.build()` returns a serializable `BuildArtifact`; `VerilatorRunNode.run()` stages one simulator and ELF in a private task directory and captures real RTL output. |
-| CHIA database | `SQLiteNode.init_schema/transaction/execute/wal_checkpoint`; FULL synchronous writes and checkpoint database copies. |
-| CHIA diagnostics/cache | `get_profiler().add_info/log_event`, `start_collector`, `start_cache`, `Bypass.set_provider/set_cond`, stable `_chia_tag`; `chia.base.ChiaFunction.get()` unwraps profiler envelopes. |
-| evolve-flows `62d27130` | `EvolverNode.run_search` and `run_skydiscover` inject `ChiaEvaluator`, but construct the default API `LLMPool` controller and do not expose proposal-stage CLI checkpoint hooks. |
-| SkyDiscover `78833ea6` | `OpenEvolveNativeDatabase.sample/add/save/load` supplies islands, MAP-Elites, archive/best tracking, inspirations, population limits and migration. `add(target_island=...)` fixes the destination when asynchronous results arrive out of order. |
-| SkyDiscover evaluator | `ChiaEvaluator` builds once, dispatches all workloads before collecting results, then invokes the mapper. One evaluator instance per candidate binds its private build artifact; no shared build/run actor state. |
+| Deployment | Native cluster YAML, `chia up`, `chia down` |
+| Tasks | `ChiaFunction`, `TrackedRef`, `chia_wait`, `get`, `chia_cancel` |
+| RTL | `ChiselBuildNode`, `BuildArtifact`, `VerilatorRunNode`, `RunResult` |
+| CLI agents/tools | `AntigravityLLM`, `ClaudeCodeLLM`, `CodexLLM`, native `BashTool` |
+| Search | Full `DiscoveryController.run_discovery`, public `LLMModelConfig.init_client` |
+| Population | `OpenEvolveNativeDatabase.sample/add/save/load` |
+| Evaluation | Async `evaluate_program` returning native `EvaluationResult` |
+| Cache | `start_cache`, callbacks on `get`, `Bypass.set_cond/set_provider` |
+| History/profiling | `SQLiteNode`, `start_collector`, native profiler events |
 
-Therefore `search.py` composes the existing native database with CHIA's three
-CLI agents and evaluator. It changes no CHIA, SkyDiscover, or OpenEvolve internals.
-The upstream controller is not reused because that would require replacing its
-API LLM pool and iteration internals to persist isolated CLI proposals. Native
-population serialization remains authoritative; the checkpoint envelope adds
-RNG, pending stages, and the SQLite snapshot. Invalid candidates are persisted
-as diagnostics and are never passed to native `add()`, which otherwise does not
-itself filter invalid candidates from unoccupied feature cells.
+## Controller integration
 
-Upstream references:
-[CHIA memcpy](https://docs.chialoops.ai/en/main/user_guides/memcpy_example.html),
-[architectural discovery](https://docs.chialoops.ai/en/main/case-studies/architectural-discovery-basic.html),
-[evolve-flows](https://github.com/ucb-bar/evolve-flows),
-[SkyDiscover](https://github.com/ucb-bar/skydiscover).
+The small [controller probe](tests/test_controller_probe.py) demonstrates two
+concurrent generations with different parents/islands and an invalid result.
+The [integration tests](tests/test_controller_integration.py) then exercise the
+production adapter, evaluator, and native checkpoints with real CHIA tasks,
+cache callbacks, profiling, and inexpensive benchmark fixtures. These checks
+preceded removal of the custom Driver.
+
+[controller.py](chia_dma/controller.py) constructs the native controller and
+supplies its public LLM initializer, evaluator, and context builder. It uses the
+same evaluator-component assignment that evolve-flows' bridge uses. There are
+no copied controller methods, private monkeypatches, custom iteration scheduler,
+or alternate controller implementation. The database subclass only records and
+recovers selections, rejects invalid admissions, and supplies their target island.
+
+At the pinned revision, `EvolverNode.run_search` accepts YAML configuration and
+an evaluator, but does not expose the callable LLM initializer, context builder,
+existing population, or proposal-aware checkpoint callback needed here. Direct
+`DiscoveryController` composition keeps those public hooks without copying the
+EvolverNode bridge or adding a local API proxy for CLI agents.
+
+CHIA cache-enabled calls return callback handles. The evaluator retains those
+handles for `get`, while passing raw refs to `chia_wait`/retry/cancel. After a
+build, all benchmark tasks are submitted together with one shared object-store
+build artifact. DMA-specific coverage, observation, output, and fitness checks
+remain in the evaluator/parser; the controller processes their results.
+
+## Native deployment and enforcement
+
+`config.yaml` contains native main-cluster and per-proposal generation-cluster
+YAML templates. Python only expands paths/identifiers and invokes the native
+CLI. Generation uses a container-only native cluster: the main cluster schedules
+its proxy task, and a private Ray instance inside the container hosts BashTool.
+This keeps the agent off the evaluator's trusted Ray domain. Dedicated generation
+containers use native `scoped_teardown: false`, so recovery removes a worker
+even while its private Ray/BashTool is still running. The empty head-start
+guard below prevents that teardown from stopping the host cluster.
+
+[chia-native.patch](patches/chia-native.patch), applied by bootstrap only inside
+`loop/.deps/chia`, contains two small compatibility fixes for the pinned CHIA:
+
+- Honor an explicit YAML Docker network instead of also forcing `--net=host`.
+- Skip stopping a host Ray head when a container-only cluster has no head-start
+  commands. Teardown hooks still run; native worker teardown removes containers.
+
+The original external CHIA checkout is untouched. These are source dependency
+patches, not runtime monkeypatches or replacement deployment implementations.
+
+Each generation has a separate Docker network, read-only root/source/toolchain,
+two writable source-file binds initialized from its selected parent, and private
+temporary home/credentials. Native YAML setup/teardown commands install/remove
+interface-specific host and private-network rejection rules. Ray binds wildcard
+sockets even when given localhost, so bridge networking alone is insufficient.
+The test starts a reachable host listener and verifies denial through both the
+Docker gateway and host IP, alongside forbidden file writes. Another check tears down an active private
+BashTool/Ray worker and verifies its container/network are removed while the
+trusted build cluster keeps working. Concurrent
+workspace tests verify the frozen tree and the other parent's files stay intact.
+
+Build workers copy the fixed seed once into a private writable checkout; builds
+overwrite the two implementation files. The original checkout is not mounted.
+The retained seed includes dependency/classpath caches, so restoration does not
+refer back to mutable caches in the original source tree. Git operations on the
+input checkout are read-only provenance queries.
+
+## Checkpoint and recovery boundaries
+
+Native checkpoint files include program solutions/metrics/lineage, the best
+program and iteration, plus `openevolve_native_metadata.json`: islands, archive,
+feature maps/statistics, island bests/generations, current island, and last
+migration generation. Native save/load remains authoritative for all of these.
+The native format has no in-flight CLI proposals or RNG-state snapshot.
+
+The additional records are deliberately small:
+
+- `candidates/<id>/request.json`: original parent, inspirations, island, sequence,
+  and backend selection, persisted before generation.
+- `proposal.json`, two complete Scala files, and a provenance diff: committed
+  before returning generation, then made read-only.
+- `state.json` beside each native checkpoint: frozen-config hash, admitted IDs,
+  and generated/evaluated flags for requests known at that checkpoint.
+- `metrics.db`: numerical results and lineage through CHIA SQLite, including
+  terminal invalid results and evaluation-complete/admission-pending results.
+
+A checkpoint writes native population and the small envelope to a new directory,
+then atomically updates `latest.json`. Completed proposals are independent of
+cache eviction and checkpoint timing. Resume repairs admission from SQLite
+without rebuilding completed evaluations; unfinished expensive work uses CHIA
+cache/bypass. New stochastic selections can differ after restart, while pending
+requests retain their exact original context.
+
+Fork uses the selected native checkpoint, copies only proposals present then,
+and filters a SQLite backup to evaluations completed then. A request unfinished
+at that checkpoint remains an unfinished request even if its original run later
+completed it. Replay uses the fixed seed plus saved complete files with fresh
+build/simulation tags and no population admission. Existing experiments are not
+rewritten. Format 3 deliberately rejects older formats; use their matching
+previous loop implementation to resume them.
 
 ## Validation evidence
 
-- All 13 contract/container tests passed (`experiments/tests.log`), including
-  native island migration, MAP-Elites persistence, invalid-result exclusion,
-  historical forks, backend switching, cache callbacks, and Docker permissions.
-- All three CHIA CLI backends authenticated inside real task containers and
-  produced allowlisted edits. Two Antigravity proposals completed concurrently
-  in `experiments/generation-fast`. Codex's companion code-mode host is mounted
-  alongside its executable. Partial provider timeouts are rejected rather than
-  being mistaken for completed proposals; the default generation budget is ten
-  minutes.
-- The existing software flow built and froze 43 ELF artifacts: 19 Embench
-  programs per CPU/DMA mode and five standalone tests. No original software,
-  benchmark, or accelerator source was modified by the loop.
-- `experiments/live-validation` passed the fresh SoC build, DMAControllerSpec,
-  all 43 seed workloads, passive metrics validation, and all 19 CPU/DMA output
-  comparisons. This includes the full 2 MiB correctness/coherence test. The
-  measured seed fitness is 1.0.
-- Public historical fork/replay in `experiments/replay-validation` passed all
-  24 workloads after a fresh independent build. Every DMA Embench cycle,
-  activity/output record and microbenchmark sample matched the baseline;
-  replay fitness is exactly 1.0 (`replay-proof.json`). No LLM call generated
-  the replayed RTL, and the original checkpoint remained unchanged.
-- `experiments/invalid-validation` forked the complete two-island population,
-  rejected a real integration-violating source through the CHIA evaluator,
-  preserved both elite maps/global best, and passed public CLI resume. Its
-  SQLite database and writable namespace are independent of the original.
-- The main cluster was stopped and restarted from `00000010-retry` with Codex
-  selected. The completed Antigravity proposal's source/metadata hashes were
-  preserved; only the unfinished generation was retried. The Antigravity design
-  subsequently failed the frozen controller test and was retained with validity
-  0. Codex's proposal passed compilation/controller tests, all 19 DMA Embench
-  programs, the microbenchmarks, and all standalone tests, including full 2 MiB
-  correctness. It was admitted with fitness 1.0. Both islands have two elite
-  cells, and native migration occurred.
-- A final public CLI resume with default Antigravity selected authenticated and
-  preserved the complete native population, tasks, RNG state, iteration count,
-  source hashes, and proposal metadata. All 43 seed workloads, 24 candidate
-  workloads and 24 replay workloads passed. The invalid proposals remain
-  diagnostic records outside the population. The original accelerator sources
-  still match the seed (`live-validation/final-acceptance.json`).
+The standard suite passed **17 tests**, with the three provider calls opt-in.
+All **three live backend checks passed** separately. A fresh self-contained seed
+also built **43 ELF inputs**, the SoC simulator, and passing controller protocol
+tests. No full RTL simulation/performance rerun was started for this refactor.
 
-The full correctness test took about 71 minutes on this host. Simulation wall
-limits are three hours and CHIA collection permits four hours. Correctness and
-performance workloads fan out together; every correctness gate must pass before
-admission. The central configuration allows up to 24 simulator tasks. During the
-independent replay/recovery test, the host budget was split between clusters.
+Evidence: [standard suite](experiments/refactor-checks/suite-final-pass.log),
+[live backends](experiments/refactor-checks/live-backends-final-pass.log),
+[interrupted native worker cleanup](experiments/refactor-checks/native-recovery-final.log),
+and [fresh build proof](experiments/refactor-checks/ssh-d8ffe8fec543478d842a7a95f2c3799b/seed-build/proof.json).
+All validation containers, networks, and their firewall rules were removed.
 
-Each experiment archives its evaluator code separately from the source seed.
-The existing DMA parser is loaded from that seed. Resume, replay and fork use
-the archived evaluator, so edits in another thread cannot change in-flight
-measurement or search rules.
+Fresh checks cover concurrent parent/island context, attempted forbidden edits,
+invalid archive rejection, benchmark fan-out, warm/cold/evicted cache behavior,
+restart after generation, evaluation-before-admission recovery, resume after
+admission, native migration, historical fork/replay, cancellation, and backend
+switching. `experiments/refactor-checks/` retains logs and native deployment
+fixtures. The controller/cache tests use cheap CHIA fixture tasks and recorded
+RTL observation data; they do not simulate RTL or establish fresh performance.
+
+Native `chia up/down` checks use real separate build/simulation containers and
+concurrent generation containers. Opt-in live CLI checks require a backend to
+compute a hash available only inside its workspace through BashTool; Claude's
+built-in tools are disabled for this check and normal generation. Provider
+credentials must be valid when running these checks.
+
+Earlier full live validation, before this controller/deployment replacement,
+passed 43 seed workloads, 24 candidate workloads, and 24 independent replay
+workloads, including full 2 MiB correctness. Candidate and replay fitness were
+1.0; an invalid generated design was rejected by controller tests. Evidence in
+`experiments/live-validation`, `replay-validation`, and `invalid-validation` is
+preserved. A later pre-replacement check passed software/SoC builds, protocol
+tests, and command-smoke, then stopped the long simulations at the user's request.
+Those results are historical evidence, distinct from this refactor's checks.
