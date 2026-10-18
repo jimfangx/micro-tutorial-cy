@@ -60,11 +60,22 @@ def main(action):
         prompt = req.get('prompt', 'Reply exactly CHIA_AUTH_OK. Do not use tools or modify any files.')
         agent = make_agent(cfg)
         result = agent.prompt(prompt, [])
+        if 'print timeout' in result.stderr.lower() and 'turn in progress' in result.stderr.lower():
+            raise RuntimeError('Agent print timeout interrupted the proposal; retry generation')
         if not result.success:
             raise RuntimeError(f'Agent failed: {result.stderr[-2000:]}')
         if action == 'auth' and 'CHIA_AUTH_OK' not in result.result:
             raise RuntimeError('Agent authentication probe did not return CHIA_AUTH_OK')
-        response = {'response': result.result, 'transcript': result.stream_result,
+        model = cfg['agent']['model'] or getattr(agent, 'model', None)
+        if not model and cfg['agent']['backend'] == 'antigravity':
+            settings = Path(agent.gemini_dir) / 'antigravity-cli/settings.json'
+            model = json.loads(settings.read_text()).get('model')
+        if not model and cfg['agent']['backend'] == 'codex':
+            import re
+            settings = Path('/home/ray/.codex/config.toml')
+            match = re.search(r'^model\s*=\s*"([^"\n]+)"', settings.read_text(), re.M) if settings.exists() else None
+            model = match.group(1) if match else 'provider-default'
+        response = {'model': model, 'response': result.result, 'transcript': result.stream_result,
                     'returncode': result.returncode, 'success': result.success}
         cli = {'antigravity': 'agy', 'claude': 'claude', 'codex': 'codex'}[cfg['agent']['backend']]
         response['agent_version'] = subprocess.check_output([cli, '--version'], text=True).strip()
@@ -106,7 +117,7 @@ def main(action):
         # applies simulation timeouts, and collects stdout/stderr itself.
         result = VerilatorRunNode().run(
             artifact, Path('/test.elf').read_bytes(), req['name'] + '.riscv', '/tmp/sim',
-            plusargs={'+cycle-count': ''}, timeout_cycles=cfg['software']['timeout_cycles'],
+            plusargs={**cfg['software']['plusargs'], f"+verilator+seed+{cfg['software']['random_seed']}": ''}, timeout_cycles=cfg['software']['timeout_cycles'],
             timeout_seconds=cfg['software']['timeout_seconds'],
             dramsim_ini_files={p.name: p.read_bytes() for p in Path('/dram').glob('*.ini')},
             verbose=False)

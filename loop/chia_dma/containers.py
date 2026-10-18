@@ -42,7 +42,7 @@ def ensure_image(cfg):
 
 
 @contextlib.contextmanager
-def container(cfg, mounts, *, agent=False):
+def container(cfg, mounts, *, agent=False, run_id="preflight"):
     from chia.cluster.config import DockerConfig
     from chia.cluster.docker import DockerManager
     name = 'chia-dma-' + uuid.uuid4().hex
@@ -56,10 +56,13 @@ def container(cfg, mounts, *, agent=False):
         engine.chmod(0o755)
         conda = cfg['runtime']['conda']
         # Do not mount ROOT wholesale: it contains the archive. Only code/deps.
-        common = [(conda, conda, 'ro'), (str(ROOT / 'chia_dma'), '/opt/loop/chia_dma', 'ro'),
+        code = Path(cfg.get('_evaluator', ROOT))
+        common = [(conda, conda, 'ro'), (str(code / 'chia_dma'), '/opt/loop/chia_dma', 'ro'),
                   (cfg['chia'], '/opt/chia', 'ro')]
+        from .config import digest
+        token = digest([cfg['storage'], run_id])[:24]
         affinity = sorted(os.sched_getaffinity(0))[:cfg['runtime']['cpus_per_build']]
-        options = ['--cpuset-cpus=' + ','.join(map(str, affinity)), '--cpus=' + str(cfg['runtime']['cpus_per_build']), '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+        options = ['--label=chia.dma.run=' + token, '--cpuset-cpus=' + ','.join(map(str, affinity)), '--cpus=' + str(cfg['runtime']['cpus_per_build']), '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
                    '--pids-limit=' + str(cfg['runtime']['pids_limit']), '--init', f'--memory={cfg["runtime"]["memory"]}',
                    '--tmpfs /tmp:rw,exec,mode=1777', '--tmpfs /home/ray:rw,exec,mode=1777',
                    f'--user {os.getuid()}:{os.getgid()}',
@@ -88,7 +91,7 @@ def container(cfg, mounts, *, agent=False):
 def run_worker(cfg, action, request, mounts, *, agent=False):
     from .artifacts import write_json, read_json
     from .config import implementation_hash
-    if cfg.get('_implementation_hash') != implementation_hash():
+    if cfg.get('_implementation_hash') != implementation_hash(cfg.get('_evaluator', ROOT)):
         raise RuntimeError('Loop/evaluator code changed during the experiment')
     Path(cfg['storage'], 'tmp').mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=action + '-', dir=Path(cfg['storage']) / 'tmp') as folder:
@@ -98,7 +101,7 @@ def run_worker(cfg, action, request, mounts, *, agent=False):
         output.mkdir()
         write_json(request_file, request)
         with container(cfg, [*mounts, (str(request_file), '/request.json', 'ro'),
-                             (str(output), '/output', 'rw')], agent=agent) as manager:
+                             (str(output), '/output', 'rw')], agent=agent, run_id=request.get('run_id', 'preflight')) as manager:
             python = str(Path(cfg['runtime']['conda']) / 'bin/python')
             try:
                 result = manager.exec_command(shlex.join([python, '-m', 'chia_dma.worker', action]),
@@ -144,5 +147,17 @@ def agent_mounts(cfg, private_home):
                 token['region'] = settings['gcp_location']
             token_file.write_text(json.dumps(token))
     cli = {'antigravity': 'agy', 'claude': 'claude', 'codex': 'codex'}[backend]
+    extra = [(str(Path(binary).resolve(strict=True)), '/usr/local/bin/' + name, 'ro')
+             for name, binary in settings.get('extra_binaries', {}).items()]
     return [(str(binary), '/usr/local/bin/' + cli, 'ro'),
-            (str(private_home), settings['credential_target'], 'rw')]
+            (str(private_home), settings['credential_target'], 'rw'), *extra]
+
+
+def cleanup_run(cfg, run_id):
+    """Reap task sandboxes left by a dead driver, only in this run namespace."""
+    from .config import digest
+    token = digest([cfg['storage'], run_id])[:24]
+    result = docker(cfg, ['ps', '-aq', '--filter', 'label=chia.dma.run=' + token], capture_output=True)
+    ids = result.stdout.split()
+    if ids:
+        docker(cfg, ['rm', '-f', *ids], capture_output=True)

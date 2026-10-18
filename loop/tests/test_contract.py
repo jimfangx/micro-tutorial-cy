@@ -23,10 +23,13 @@ def records(cfg):
     result = {}
     for row in data['embench']:
         name = f'embench:{row["mode"]}:{row["benchmark"]}'
-        text = 'EMBENCH ' + ' '.join(f'{k}={v}' for k,v in row.items() if isinstance(v,int))
-        result[name] = parse(name, {'success': True, 'returncode': 0, 'log':text, 'out':''}, cfg)
-    text = '\n'.join('MICRO '+' '.join(f'{k}={v}' for k,v in row.items()) for row in data['microbench'])
-    result['microbench'] = parse('microbench', {'success':True,'returncode':0,'log':text+'\nDMA microbenchmark PASS','out':''},cfg)
+        # Historical full-suite fixture predates metrics version 1. It is input
+        # to aggregation tests only; the runtime parser must reject it now.
+        result[name] = dict(row)
+    copies = copy.deepcopy(data['microbench'])
+    for row in copies:
+        row['bandwidth_bytes_per_cycle'] = row['bytes']/row['dma_cycles']
+    result['microbench'] = {'copies': copies}
     return result
 
 
@@ -62,6 +65,21 @@ def test_failed_or_incomplete_simulation_never_yields_score(cfg):
             parse('embench:dma:wikisort',result,cfg)
     with pytest.raises(ValueError):
         parse('microbench',{'success':True,'returncode':0,'log':'DMA microbenchmark PASS','out':''},cfg)
+
+
+def test_passive_hardware_metrics_are_required_by_chia(cfg, tmp_path):
+    cfg['software']['standalone']['basic'] = {'marker': 'DMA basic PASS'}
+    fixture = Path(__file__).resolve().parents[2] / 'software/rocc-dma/tests/fixtures/observed-basic.txt'
+    parser = tmp_path / 'tree/software/rocc-dma/scripts/metrics.py'
+    parser.parent.mkdir(parents=True)
+    parser.write_text((fixture.parents[2] / 'scripts/metrics.py').read_text())
+    text = fixture.read_text()
+    result = {'success': True, 'returncode': 0, 'log': text, 'out': ''}
+    row = parse('basic', result, cfg, tmp_path)
+    assert row['hardware']['write_acks'] == 1
+    assert row['copy_events'][0]['hw_cycles'] == 34
+    with pytest.raises(ValueError):
+        parse('basic', {**result, 'log': text.replace('outstanding=0', 'outstanding=1')}, cfg, tmp_path)
 
 
 def test_proposal_commit_is_immutable_and_has_exact_allowlist(tmp_path):

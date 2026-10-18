@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+from metrics import parse as parse_metrics
 
 WORK = Path(__file__).resolve().parents[1]
 ROOT = WORK.parents[1]
@@ -104,12 +105,10 @@ def run_one(mode, bench, sim_hash):
                "EXTRA_SIM_FLAGS=+cycle-count", f"EXTRA_SIM_OUT_NAME={mode}"]
     run_logged(command, log)
     data = log.read_text()
-    lines = [line for line in data.splitlines() if line.startswith("EMBENCH ")]
-    if len(lines) != 1:
-        raise RuntimeError(f"Missing unique completion record: {mode} {bench}; see {log}")
-    result = {k: int(v) for k, v in re.findall(r"(\w+)=(-?\d+)", lines[0])}
-    if result["result"] or not result["verification_result"] or result["errors"]:
-        raise RuntimeError(f"Benchmark failed: {mode} {bench}: {result}")
+    measured = parse_metrics(data, "embench")
+    result = measured["software"]
+    result["hardware"] = measured["hardware"]
+    result["copy_events"] = measured["copies"]
     result.update(mode=mode, benchmark=bench, elf_sha256=sha(binary), sim_sha256=sim_hash,
                   log_sha256=sha(log))
     return result

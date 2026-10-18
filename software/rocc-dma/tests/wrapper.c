@@ -26,6 +26,22 @@ int main(void) {
 #else
     if(dma_stats.offloaded!=5 || dma_stats.bytes!=12936 || dma_stats.fallback!=7) return 8;
 #endif
+    if(dma_stats.attempts != dma_stats.offloaded+dma_stats.errors ||
+       dma_stats.intercepted != dma_stats.attempts+dma_stats.fallback-dma_stats.retry_fallback) return 9;
+    uint64_t histogram_total=0;
+    for(unsigned i=0;i<8;i++) histogram_total+=dma_stats.histogram[i];
+    if(histogram_total!=dma_stats.offloaded) return 10;
+#ifndef DMA_DISABLED
+    if(!dma_stats.min_cycles || dma_stats.max_cycles<dma_stats.min_cycles ||
+       dma_stats.e2e_cycles<dma_stats.cycles || dma_stats.histogram[1]!=1 ||
+       dma_stats.histogram[2]!=1 || dma_stats.histogram[3]!=1 ||
+       dma_stats.histogram[4]!=1 || dma_stats.histogram[5]!=1) return 11;
+#endif
+    struct dma_statistics total;
+    dma_stats_snapshot(&total);
+    printf("DMA_STATS metrics_version=1");
+    dma_stats_print(&total, "");
+    putchar('\n');
     printf("DMA wrapper PASS intercepted=%lu offloaded=%lu fallback=%lu bytes=%lu cycles=%lu\n",
         dma_stats.intercepted,dma_stats.offloaded,dma_stats.fallback,dma_stats.bytes,dma_stats.cycles);
     return 0;

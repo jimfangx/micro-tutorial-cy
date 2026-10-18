@@ -71,14 +71,14 @@ class DMAEvaluator(ChiaEvaluator):
         refs = [self.dispatch_run(name) for name in self.correctness]
         try:
             results = await asyncio.to_thread(resolve, refs, timeout=self.timeout)
-            self.gate_records = {name: parse(name, result, self.cfg) for name, result in zip(self.correctness, results)}
+            self.gate_records = {name: parse(name, result, self.cfg, self.seed) for name, result in zip(self.correctness, results)}
         except Exception as error:
             return EvaluationResult({'combined_score': 0.0, 'validity': 0}, {'error': str(error), 'failure_stage': 'correctness'})
         return result
 
     def map_results(self, runs):
         try:
-            records = {**self.gate_records, **{name: parse(name, result, self.cfg) for name, result in zip(self.workloads, runs)}}
+            records = {**self.gate_records, **{name: parse(name, result, self.cfg, self.seed) for name, result in zip(self.workloads, runs)}}
             proposal = read_json(self.run / 'candidates' / self.candidate / 'proposal.json')
             reference_file = self.run / 'reference.json'
             reference = records if self.baseline else read_json(reference_file)

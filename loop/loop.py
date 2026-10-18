@@ -12,7 +12,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from chia_dma.config import ROOT, digest, frozen, load
 from chia_dma.artifacts import (RunLock, archive_proposal, git, read_json, snapshot,
-                                source_bundle, write_json)
+                                source_bundle, freeze_loop, write_json)
 
 
 def bootstrap(cfg):
@@ -26,7 +26,7 @@ def scheduler(cfg, run):
     from chia.base.cache import start_cache
     from chia.base.bypass import Bypass
     runtime = cfg['runtime']
-    options = {'namespace': 'dma-' + run.name}
+    options = {'namespace': 'dma-' + digest(str(run))[:24]}
     if runtime['ray_address']:
         options['address'] = runtime['ray_address']
     else:
@@ -35,7 +35,7 @@ def scheduler(cfg, run):
             'verilator_run': runtime['simulation_slots']}, _node_ip_address='127.0.0.1')
     # Paths are host-side orchestration paths. Agent containers see none of them.
     options['runtime_env'] = {'env_vars': {'PYTHONPATH': os.pathsep.join([
-        str(ROOT), cfg['chia'], cfg['skydiscover'], cfg['evolve_flows']]),
+        cfg.get('_evaluator', str(ROOT)), cfg['chia'], cfg['skydiscover'], cfg['evolve_flows']]),
         'PYTHONHASHSEED': str(cfg['search']['random_seed'])}}
     ray.init(**options)
     available = ray.cluster_resources()
@@ -67,6 +67,7 @@ def init(cfg, run):
     if (run / 'run.json').exists():
         raise ValueError('Experiment already exists; use resume')
     run.mkdir(parents=True, exist_ok=True)
+    freeze_loop(cfg, run)
     proof = preflight(cfg)
     seed = snapshot(cfg)
     manifest = prepare_software(cfg, run, seed)
@@ -102,6 +103,8 @@ def fork(cfg, origin, checkpoint, target):
     if data['frozen_hash'] != digest(frozen(cfg)):
         raise ValueError('Fork configuration differs from historical checkpoint')
     target.mkdir(parents=True)
+    if (origin / 'evaluator').exists():
+        shutil.copytree(origin / 'evaluator', target / 'evaluator')
     shutil.copytree(origin / 'software', target / 'software')
     shutil.copytree(cp, target / 'checkpoints' / checkpoint)
     # Proposal snapshots are immutable; copy creates a separate writable
@@ -117,6 +120,8 @@ def fork(cfg, origin, checkpoint, target):
     # Metadata database is independent and is populated from native state/tasks.
     from chia_dma.state import State
     state = State(cfg, target)
+    state.sql.execute('UPDATE candidates SET proposal=REPLACE(proposal,?,?)',
+                      (str(origin / 'candidates'), str(target / 'candidates')))
     state.checkpoint('forked')
     state.close()
     print(f'Forked {origin.name}/{checkpoint} into {target.name}')
@@ -132,12 +137,19 @@ def main():
     parser.add_argument('--new-run')
     args = parser.parse_args()
     cfg = load(args.config)
-    if os.path.abspath(sys.executable) != cfg['python']:
-        os.execv(cfg['python'], [cfg['python'], str(Path(__file__).resolve()), *sys.argv[1:]])
+    seed = str(cfg['search']['random_seed'])
+    if os.path.abspath(sys.executable) != cfg['python'] or os.environ.get('PYTHONHASHSEED') != seed:
+        env = {**os.environ, 'PYTHONHASHSEED': seed}
+        os.execve(cfg['python'], [cfg['python'], str(Path(__file__).resolve()), *sys.argv[1:]], env)
     bootstrap(cfg)
     if Path(args.run).name != args.run or args.run in ('.', '..'):
         parser.error('--run must be a simple experiment name')
     run = Path(cfg['storage']) / args.run
+    archived = run / 'evaluator' / 'loop.py'
+    if archived.exists() and Path(__file__).resolve() != archived.resolve() and args.action in ('run', 'resume', 'replay', 'fork'):
+        os.execv(cfg['python'], [cfg['python'], str(archived), '--config', cfg['_config_file'], *sys.argv[1:]])
+    if archived.exists():
+        cfg['_evaluator'] = str(archived.parent)
     if args.action == 'image':
         from chia_dma.containers import ensure_image
         ensure_image(cfg)
@@ -166,6 +178,8 @@ def main():
         return
     run.mkdir(parents=True, exist_ok=True)
     with RunLock(run):
+        from chia_dma.containers import cleanup_run
+        cleanup_run(cfg, run.name)
         if args.action == 'init':
             init(cfg, run)
             return
@@ -204,6 +218,7 @@ def main():
         finally:
             state.close()
             shutdown()
+            cleanup_run(cfg, run.name)
 
 
 if __name__ == '__main__':

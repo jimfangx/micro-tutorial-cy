@@ -54,6 +54,14 @@ def files(root):
 
 
 
+def sync_directory(path):
+    fd = os.open(path, os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def sync_tree(root):
     """Make immutable artifact publication durable across a host reboot."""
     for folder, dirs, names in os.walk(root, topdown=False):
@@ -136,6 +144,7 @@ def snapshot(cfg):
     else:
         sync_tree(temp)
         temp.rename(target)
+        sync_directory(target.parent)
         readonly(target)
     return target
 
@@ -189,6 +198,7 @@ def archive_proposal(run, candidate_id, bundle, parent_bundle, metadata):
     readonly(temp)
     # Rename is the proposal commit point; generation is reusable from here on.
     temp.rename(target)
+    sync_directory(target.parent)
     return target
 
 
@@ -202,3 +212,23 @@ class RunLock:
         return self
     def __exit__(self, *args):
         self.file.close()
+
+
+def freeze_loop(cfg, run):
+    """Archive the small evaluator/driver implementation with this experiment."""
+    from .config import ROOT, implementation_hash
+    target = Path(run) / 'evaluator'
+    if not target.exists():
+        temp = target.with_name('.evaluator-' + uuid.uuid4().hex)
+        temp.mkdir()
+        shutil.copytree(ROOT / 'chia_dma', temp / 'chia_dma', ignore=shutil.ignore_patterns('__pycache__'))
+        for name in ('loop.py', 'Dockerfile'):
+            shutil.copyfile(ROOT / name, temp / name)
+        if implementation_hash(temp) != cfg['_implementation_hash']:
+            raise RuntimeError('Loop changed while capturing evaluator; retry initialization')
+        sync_tree(temp)
+        temp.rename(target)
+        sync_directory(target.parent)
+        readonly(target)
+    cfg['_evaluator'] = str(target)
+    return target

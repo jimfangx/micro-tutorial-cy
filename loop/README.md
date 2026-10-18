@@ -56,8 +56,9 @@ Builds copy the immutable seed into independent writable trees. Simulation
 containers receive only the simulator artifact, a frozen ELF, and DRAM settings.
 The integration mixin and disabled L1 interface are checked before compilation.
 
-[metrics.py](chia_dma/metrics.py) parses the existing Embench and DMA microbench
-records. Correctness, complete coverage, deterministic benchmark outputs, and
+[metrics.py](chia_dma/metrics.py) delegates parsing to the existing software
+metrics parser captured in the immutable seed, including passive simulator
+observations and Embench/DMA microbenchmark records. Correctness, complete coverage, deterministic benchmark outputs, and
 unchanged DMA activity gate admission. Fitness is a weighted geometric mean of
 speedups relative to the DMA-enabled seed, with separately normalized Embench
 and microbenchmark groups. Embench programs with no timed DMA activity remain
@@ -88,8 +89,11 @@ Change `agent.backend` to `claude` or `codex` to switch agents on resume. Set it
 binary/credentials/options in the same configuration file. This preserves the
 population/history and starts fresh conversational context. You may increase
 `search.iterations` or change resource limits on resume. Hardware/software,
-fitness/search rules, evaluator code, dependency revisions, and container image
-are checked for drift; changing them requires a new experiment and baseline.
+fitness/search rules, dependency revisions, and container image are checked for
+drift; changing them requires a new experiment and baseline. Each run archives
+its evaluator code in `evaluator/`; resume, replay, and fork automatically use
+that archive. Edits to the live loop or metrics parser cannot alter an in-flight
+experiment. Capture a new seed to adopt updated software or instrumentation.
 
 The driver runs CHIA/Ray on this host by default and shuts it down on exit.
 For an existing scheduler, set `runtime.ray_address`; its trusted orchestration
@@ -99,7 +103,7 @@ storage. Agent processes themselves never run on those trusted workers.
 
 ## Artifacts and checks
 
-Each run contains `run.json`, `software/manifest.json`, `reference.json`,
+Each run contains its frozen `evaluator/`, `run.json`, `software/manifest.json`, `reference.json`,
 `metrics.db`, immutable `candidates/<id>/{rtl,changes.patch,proposal.json}`,
 `artifacts/<id>/` (simulator, logs, per-workload records and metrics), native
 `checkpoints/`, and CHIA profiler output. Source snapshots include uncommitted

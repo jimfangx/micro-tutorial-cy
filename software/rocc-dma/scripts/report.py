@@ -3,6 +3,8 @@
 import json
 import re
 from pathlib import Path
+import hashlib
+from metrics import parse as parse_metrics
 
 WORK = Path(__file__).resolve().parents[1]
 ROOT = WORK.parents[1]
@@ -46,6 +48,16 @@ def main():
             "Microbenchmark measurements incomplete")
     manifest = json.loads((BUILD / "embench-manifest.json").read_text())
     records = json.loads((BUILD / "embench-results.json").read_text())
+    # Historical first-cut records must never masquerade as current metrics.
+    sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+    simulator_sha = sha(ROOT / "sims/verilator/simulator-chipyard.harness-DMARocketConfig")
+    for record in records:
+        mode, bench = record["mode"], record["benchmark"]
+        log = LOGS / f"embench-{mode}-{bench}.log"
+        require(record["sim_sha256"] == simulator_sha and
+                record["elf_sha256"] == sha(BUILD / f"embench-{mode}/src/{bench}/{bench}") and
+                record["log_sha256"] == sha(log), f"Stale result: {mode} {bench}; rerun this workload")
+        parse_metrics(log.read_text(), "embench")
     benchmarks = sorted(p.name for p in (ROOT / "tests/embench-iot/src").iterdir() if p.is_dir())
     require(benchmarks == sorted(manifest["benchmarks"]), "Suite inventory changed")
     inspection = manifest["inspection"]

@@ -1,68 +1,30 @@
 """Parse fixed RTL output and calculate reproducible, correctness-gated fitness."""
 import math
-import re
+import importlib.util
+from pathlib import Path
 from .config import digest
 
-
-def fields(line):
-    return {k: int(v) for k, v in re.findall(r'(\w+)=(-?\d+)', line)}
-
-
-def parse(name, result, cfg):
+def parse(name, result, cfg, seed=None):
+    """Delegate validation to the existing parser from the immutable seed."""
     if not result.get('success') or result.get('returncode') != 0:
         raise ValueError(f'{name}: simulator failed or timed out')
-    text = result['log'] + '\n' + result['out']
-    if re.search(r'Assertion failed|%Error|\*\*\* FAILED|\bFAIL\b', text):
-        raise ValueError(f'{name}: RTL assertion or test failure')
-    if name.startswith('embench:'):
-        records = re.findall(r'^EMBENCH .*$', text, re.M)
-        if len(records) != 1:
-            raise ValueError(f'{name}: expected one Embench completion record')
-        row = fields(records[0])
-        required = ('result', 'benchmark_result', 'verification_result', 'errors', 'main_cycles',
-                    'benchmark_cycles', 'intercepted', 'offloaded', 'fallback', 'bytes',
-                    'dma_cycles', 'setup_cycles', 'region_offloaded', 'region_bytes')
-        if any(k not in row for k in required):
-            raise ValueError(f'{name}: incomplete performance counters')
-        if row['result'] or not row['verification_result'] or row['errors']:
-            raise ValueError(f'{name}: benchmark correctness failure')
-        if row['benchmark_cycles'] <= 0 or row['main_cycles'] <= 0:
-            raise ValueError(f'{name}: invalid cycle measurement')
-        if row['intercepted'] != row['offloaded'] + row['fallback']:
-            raise ValueError(f'{name}: unaccounted intercepted copies')
-        if min(row[k] for k in ('intercepted', 'offloaded', 'fallback', 'bytes', 'dma_cycles', 'setup_cycles')) < 0:
-            raise ValueError(f'{name}: negative DMA measurement')
-        if row['offloaded'] and (row['bytes'] <= 0 or row['dma_cycles'] <= 0):
-            raise ValueError(f'{name}: DMA copies without DMA bytes or duration')
-        return row
-    settings = cfg['software']['standalone'][name]
-    if settings['marker'] not in text:
-        raise ValueError(f'{name}: missing correctness completion marker')
+    root = Path(seed) / 'tree' if seed else Path(cfg['source'])
+    path = root / cfg['software']['metrics_parser']
+    if not path.is_file():
+        raise ValueError('Seed predates the required DMA observer/parser; capture a new seed')
+    spec = importlib.util.spec_from_file_location('frozen_dma_metrics', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    data = module.parse(result['log'] + '\n' + result['out'],
+                        'embench' if name.startswith('embench:') else name,
+                        success=result['success'], returncode=result['returncode'])
+    extra = {'hardware': data['hardware'], 'copy_events': data['copies']}
     if name == 'microbench':
-        rows = [fields(line) for line in re.findall(r'^MICRO .*$', text, re.M)]
-        if not rows or len({r['bytes'] for r in rows}) != len(rows):
-            raise ValueError('Missing or duplicate microbenchmark samples')
-        for row in rows:
-            if any(row.get(k, 0) <= 0 for k in ('bytes', 'cpu_cycles', 'dma_cycles', 'op_cycles', 'setup_cycles')):
-                raise ValueError('Incomplete DMA latency measurement')
+        for row in data['samples']:
             row['bandwidth_bytes_per_cycle'] = row['bytes'] / row['dma_cycles']
             row['operation_bandwidth_bytes_per_cycle'] = row['bytes'] / row['op_cycles']
-        return {'copies': rows}
-    if name.startswith('wrapper-'):
-        records = re.findall(r'^DMA wrapper PASS .*$', text, re.M)
-        if len(records) != 1:
-            raise ValueError('Missing wrapper operation counts')
-        row = fields(records[0])
-        if name == 'wrapper-dma' and (row.get('offloaded'), row.get('bytes')) != (5, 12936):
-            raise ValueError('Wrapper failed to perform the fixed DMA workload')
-        if name == 'wrapper-cpu' and row.get('offloaded') != 0:
-            raise ValueError('CPU-only wrapper used DMA')
-        return row
-    if name == 'correctness':
-        for size in (0, 8, 24, 64, 192, 8192, 65536, 2097152):
-            if f'DMA correctness bytes={size} PASS' not in text:
-                raise ValueError(f'Missing {size}-byte correctness case')
-    return {'correct': True}
+        return {'copies': data['samples'], 'alignment_samples': data['alignment_samples'], **extra}
+    return {**data.get('software', {'correct': True}), **extra}
 
 
 def aggregate(records, reference, cfg, source, hardware=None):

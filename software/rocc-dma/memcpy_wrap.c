@@ -13,6 +13,7 @@ void *__wrap_memcpy(void *dst, const void *src, size_t n) {
             printf("fatal DMA error status=%d\n",result);
             exit(90);
         }
+        dma_stats.retry_fallback++;
     }
 #endif
     dma_stats.fallback++;

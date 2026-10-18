@@ -1,6 +1,7 @@
 """CHIA-scheduled tasks. Independent generation/build/simulation resources."""
 from pathlib import Path
 import json
+import base64
 import shutil
 import tempfile
 import time
@@ -14,6 +15,8 @@ from .containers import agent_mounts, run_worker
 
 def event(operation, **metadata):
     profiler = get_profiler()
+    import ray
+    metadata['task_id'] = str(ray.get_runtime_context().get_task_id())
     profiler.add_info({'operation': operation, **metadata})
     profiler.log_event('dma_' + operation, **metadata)
 
@@ -44,14 +47,14 @@ def generate(cfg, run, seed, task):
             mounts.append((str(p), '/workspace/' + name, 'rw'))
         mounts += agent_mounts(cfg, folder / 'credentials')
         event('generation', run_id=Path(run).name, candidate_id=cid, island=task['island'],
-              parent=task['parent_id'], agent=cfg['agent']['backend'], model=cfg['agent']['model'])
-        response = run_worker(cfg, 'generate', {'cfg': cfg, 'prompt': task['prompt']}, mounts, agent=True)
+              parent=task['parent_id'], iteration=task['iteration'], inspirations=task['inspiration_ids'], agent=cfg['agent']['backend'], model=cfg['agent']['model'])
+        response = run_worker(cfg, 'generate', {'cfg': cfg, 'run_id': Path(run).name, 'prompt': task['prompt']}, mounts, agent=True)
         # Only direct writes to the mounted implementation files are accepted.
         bundle = {name: (rw / Path(name).name).read_text() for name in ALLOWLIST}
         if bundle != response['source']:
             raise ValueError('Worker source differs from its assigned writable files')
         result = {**task, 'parent_hash': digest(parent), 'backend': cfg['agent']['backend'],
-                  'model': cfg['agent']['model'], 'generation': {k: v for k, v in response.items() if k not in ('source', '_files')}}
+                  'model': response.get('model', cfg['agent']['model']), 'generation': {k: v for k, v in response.items() if k not in ('source', '_files')}}
         archive_proposal(run, cid, bundle, parent, result)
         event('generated', run_id=Path(run).name, candidate_id=cid, source_hash=digest(bundle))
         return read_json(proposed)
@@ -87,7 +90,7 @@ def build(cfg, run, seed, candidate):
                 path.chmod(path.stat().st_mode | 0o200 | (0o100 if path.is_dir() else 0))
         tree.chmod(0o755)
         event('build', run_id=Path(run).name, candidate_id=candidate)
-        response = run_worker(cfg, 'build', {'cfg': cfg}, [(str(tree), '/workspace', 'rw')])
+        response = run_worker(cfg, 'build', {'cfg': cfg, 'run_id': Path(run).name}, [(str(tree), '/workspace', 'rw')])
         save_files(dest, response)
         # Persist the build (including a failed build) before any simulator tasks.
         write_json(result_file, response)
@@ -108,11 +111,11 @@ def simulate(cfg, run, seed, candidate, workload, artifact):
         raise ValueError('Frozen benchmark ELF hash mismatch')
     ini = Path(seed) / 'tree' / cfg['software']['dram_ini']
     event('simulation', run_id=Path(run).name, candidate_id=candidate, benchmark=workload)
-    response = run_worker(cfg, 'run', {'cfg': cfg, 'artifact': artifact, 'name': workload.replace(':', '_')},
+    response = run_worker(cfg, 'run', {'cfg': cfg, 'run_id': Path(run).name, 'artifact': artifact, 'name': workload.replace(':', '_')},
                           [(str(elf), '/test.elf', 'ro'), (str(ini), '/dram', 'ro')])
     save_files(dest, response)
     response.update(workload=workload, elf_sha256=spec['sha256'],
-                    simulator_sha256=digest(artifact['simulator_binary_content']['_bytes'].encode()))
+                    simulator_sha256=digest(base64.b64decode(artifact['simulator_binary_content']['_bytes'])))
     write_json(path, response)
     return response
 

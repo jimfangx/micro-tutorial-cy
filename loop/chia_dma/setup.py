@@ -3,7 +3,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from .artifacts import copy_tree, digest, files, read_json, readonly, sync_tree, write_json
+from .artifacts import copy_tree, digest, files, read_json, readonly, sync_directory, sync_tree, write_json
 from .containers import agent_mounts, docker, run_worker
 from .tasks import save_files
 
@@ -38,7 +38,7 @@ def prepare_software(cfg, run, seed):
             if not p.is_symlink():
                 p.chmod(p.stat().st_mode | 0o200 | (0o100 if p.is_dir() else 0))
         before = files(tree)
-        response = run_worker(cfg, 'software', {'cfg': cfg}, [(str(tree), '/workspace', 'rw')])
+        response = run_worker(cfg, 'software', {'cfg': cfg, 'run_id': Path(run).name}, [(str(tree), '/workspace', 'rw')])
         save_files(Path(run) / 'artifacts' / 'software', response)
         after = files(tree)
         # All originally captured files, including benchmark sources, shim,
@@ -69,5 +69,6 @@ def prepare_software(cfg, run, seed):
         write_json(temp / 'manifest.json', manifest)
         sync_tree(temp)
         temp.rename(target)
+        sync_directory(target.parent)
         readonly(target)
         return manifest

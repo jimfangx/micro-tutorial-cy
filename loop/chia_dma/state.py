@@ -7,7 +7,7 @@ import uuid
 from chia.database.sqlite_node import SQLiteNode
 from skydiscover.config import OpenEvolveNativeDatabaseConfig
 from skydiscover.search.openevolve_native.database import OpenEvolveNativeDatabase
-from .artifacts import archive_proposal, readonly, read_json, sync_tree, write_json
+from .artifacts import archive_proposal, readonly, read_json, sync_directory, sync_tree, write_json
 from .config import digest, frozen
 
 SCHEMA = '''
@@ -63,6 +63,8 @@ class State:
         self.sequence = state['sequence']
         self.next_iteration = state['next_iteration']
         random.setstate(tuples(state['random_state']))
+        self.sql.execute('INSERT OR REPLACE INTO checkpoints VALUES (?,?,?)',
+                         (checkpoint.name, checkpoint.name.split('-', 1)[1], str(checkpoint)))
 
     def checkpoint(self, stage):
         # Native migration/empty-island seeding may create equivalent programs.
@@ -100,6 +102,7 @@ class State:
         sync_tree(temp)
         final = root / name
         temp.rename(final)
+        sync_directory(root)
         readonly(final)
         self.sql.execute('INSERT OR REPLACE INTO checkpoints VALUES (?,?,?)', (name, stage, str(final)))
         write_json(self.run / 'latest.json', {'checkpoint': name})

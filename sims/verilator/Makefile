@@ -57,6 +57,7 @@ $(sim_files): $(SIM_FILE_REQS) $(ALL_MODS_FILELIST) | $(GEN_COLLATERAL_DIR)
 # import other necessary rules and variables
 #########################################################################################
 include $(base_dir)/common.mk
+include $(base_dir)/software/rocc-dma/sim/Makefrag
 
 #########################################################################################
 # verilator-specific user-interface variables and commands

@@ -18,9 +18,10 @@ def digest(value):
     return hashlib.sha256(data).hexdigest()
 
 
-def implementation_hash():
-    paths = [ROOT / 'loop.py', ROOT / 'Dockerfile', *sorted((ROOT / 'chia_dma').glob('*.py'))]
-    return digest({str(p.relative_to(ROOT)): digest(p.read_bytes()) for p in paths})
+def implementation_hash(root=ROOT):
+    root = Path(root)
+    paths = [root / 'loop.py', root / 'Dockerfile', *sorted((root / 'chia_dma').glob('*.py'))]
+    return digest({str(p.relative_to(root)): digest(p.read_bytes()) for p in paths})
 
 
 def load(path=ROOT / 'config.yaml'):
@@ -33,6 +34,8 @@ def load(path=ROOT / 'config.yaml'):
     for backend in cfg['agent']['backends'].values():
         for key in ('binary', 'credentials'):
             backend[key] = str((path.parent / backend[key]).resolve())
+        backend['extra_binaries'] = {name: str((path.parent / binary).resolve())
+                                     for name, binary in backend.get('extra_binaries', {}).items()}
     if tuple(cfg['hardware']['allowlist']) != ALLOWLIST:
         raise ValueError('The DMA implementation allowlist is fixed; establish a new integration to expand it')
     if cfg['agent']['backend'] not in cfg['agent']['backends']:
@@ -50,7 +53,7 @@ def load(path=ROOT / 'config.yaml'):
 def frozen(cfg):
     """Backend/model may change on resume; evaluation and search rules may not."""
     data = copy.deepcopy(cfg)
-    for key in ('agent', '_config_file', 'python', 'chia', 'skydiscover', 'evolve_flows', 'storage', 'source'):
+    for key in ('agent', '_config_file', '_evaluator', 'python', 'chia', 'skydiscover', 'evolve_flows', 'storage', 'source'):
         data.pop(key, None)
     data['runtime'] = {k: v for k, v in data['runtime'].items() if k in ('image', 'environment')}
     data['search'].pop('iterations', None)

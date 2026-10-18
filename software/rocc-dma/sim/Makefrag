@@ -1,0 +1,9 @@
+# Simulation-only input taps. Never included by synthesis or hardware elaboration.
+ifneq ($(filter DMARocketConfig DMAStallRocketConfig,$(CONFIG)),)
+DMA_OBSERVER_DIR := $(base_dir)/software/rocc-dma/sim
+DMA_BIND := $(build_dir)/dma-observer-bind.sv
+$(DMA_BIND): $(sim_common_files) $(DMA_OBSERVER_DIR)/bind.py
+	python $(DMA_OBSERVER_DIR)/bind.py $(GEN_COLLATERAL_DIR)/RoCCDMA.sv $@
+EXTRA_SIM_SOURCES += $(DMA_OBSERVER_DIR)/DMAPassiveMonitor.sv $(DMA_BIND)
+EXTRA_SIM_REQS += $(DMA_OBSERVER_DIR)/DMAPassiveMonitor.sv $(DMA_BIND)
+endif

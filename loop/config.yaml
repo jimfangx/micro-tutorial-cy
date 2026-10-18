@@ -31,7 +31,7 @@ runtime:
 agent:
   backend: antigravity  # antigravity | claude | codex
   model: null           # null uses the provider's configured default
-  timeout_seconds: 900
+  timeout_seconds: 180
   retries: 1
   authenticate_before_run: true
   # Every proposal gets a PRIVATE copy of credentials/session files. No agent
@@ -43,7 +43,7 @@ agent:
       credential_target: /home/ray/.gemini
       gcp_project: agy-tutorial
       gcp_location: global
-      options: {}
+      options: {extra_cli_args: [--effort, low]}
     claude:
       binary: ${HOME}/.local/bin/claude
       credentials: ${HOME}/.claude
@@ -51,6 +51,8 @@ agent:
       options: {projects_cwd: null}
     codex:
       binary: ${HOME}/.local/bin/codex
+      extra_binaries:
+        codex-code-mode-host: ${HOME}/.codex/packages/standalone/current/bin/codex-code-mode-host
       credentials: ${HOME}/.codex
       credential_target: /home/ray/.codex
       options: {}
@@ -84,6 +86,7 @@ hardware:
     -Dsbt.boot.directory=/workspace/.sbt/boot, "chipyard/testOnly chipyard.dma.DMAControllerSpec"]
   extra_make_args: {JAVA_HEAP_SIZE: 8G}
 software:
+  metrics_parser: software/rocc-dma/scripts/metrics.py
   # Freeze the existing build flow once per experiment, before generating RTL.
   build_commands:
     - [make, -C, software/rocc-dma, libraries,
@@ -102,6 +105,8 @@ software:
     wrapper-cpu: {elf: software/rocc-dma/build/wrapper-cpu.riscv, marker: DMA wrapper PASS}
     microbench: {elf: software/rocc-dma/build/microbench.riscv, marker: DMA microbenchmark PASS}
   dram_ini: generators/testchipip/src/main/resources/dramsim2_ini
+  random_seed: 42
+  plusargs: {"+cycle-count": "", "+loadmem": "/test.elf"}
   timeout_cycles: 1000000000
   timeout_seconds: 600
 fitness:

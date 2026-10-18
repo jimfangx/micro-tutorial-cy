@@ -233,3 +233,12 @@ checkout. Its upstream benchmark and support files are used without edits.
 The Rocket, inclusive-cache, TestChipIP, and DRAMSim2 submodule commits match the
 original Chipyard base, with clean worktrees. Existing conda/environment changes
 in this workspace belong to the supplied toolchain setup.
+
+## Passive metrics for CHIA
+
+See [OBSERVABILITY.md](OBSERVABILITY.md) for the versioned RoCC/TileLink records,
+shim counters and histogram, precise mcycle boundaries, strict CHIA parser, and
+reproduction commands. [METRICS.md](METRICS.md) records the incremental validation.
+The accelerator RTL and its command interface are unchanged. The original
+[RESULTS.md](RESULTS.md) retains the first-cut full-suite measurements from before
+the software statistics extension.

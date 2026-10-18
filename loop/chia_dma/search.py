@@ -23,7 +23,9 @@ Keep WithRoCCDMA and the disabled io.mem assignments unchanged.
 Only the two supplied accelerator Scala files are writable. Directly overwrite
 file contents (e.g. Python open(path, "w")); atomic rename editors cannot replace
 read-only bind-mount entries. Do not attempt to change permissions or mount
-points. Make a small concrete improvement; do not spend time tuning details.
+points. Generation is edit-only: do not compile or run tests in this workspace.
+Read at most six files, make one small concrete change, then finish immediately.
+The separate evaluator owns compilation and testing; do not tune or iterate here.
 '''
 
 
