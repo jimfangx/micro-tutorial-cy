@@ -192,3 +192,25 @@ def test_allowlisted_file_cannot_change_fixed_soc_mixin_or_l1():
     with pytest.raises(ValueError,match='L1'):
         validate_integration(candidate,source)
     validate_integration(source,source)
+
+
+def test_parallel_collection_unwraps_cache_and_profiler_callbacks(tmp_path,ray_runtime):
+    import ray
+    from chia.base.ChiaFunction import ChiaFunction
+    from chia.base.cache import start_cache,stop_cache
+    from chia.trace.profiler import start_collector,stop_collector,reset_profiler
+    from chia_dma.evaluator import resolve
+    policy=tmp_path/'cache.yaml';policy.write_text('cache:\n  measured: true\n')
+    start_collector(log_dir=str(tmp_path/'profile'))
+    reset_profiler()
+    start_cache(1,str(tmp_path/'cache'),units='MB',yaml_path=str(policy))
+    @ChiaFunction(num_cpus=0.1)
+    def measured(value):
+        return {'cycles':value}
+    try:
+        refs=[measured.chia_remote(i,_chia_tag=f'run/candidate/workload/{i}') for i in (10,20)]
+        assert resolve(refs,timeout=30)==[{'cycles':10},{'cycles':20}]
+    finally:
+        stop_cache()
+        stop_collector()
+        reset_profiler()

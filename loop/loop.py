@@ -149,12 +149,15 @@ def main():
                           'authenticated': isinstance(proof['authentication'], dict)}, indent=2))
         return
     if args.action == 'status':
-        from chia_dma.state import State
-        state = State(cfg, run)
-        print(json.dumps({'run': run.name, 'checkpoint': read_json(run / 'latest.json'),
-                          'population': state.population.get_statistics(),
-                          'tasks': {k: v['stage'] for k, v in state.tasks.items()}}, indent=2))
-        state.close()
+        latest = read_json(run / 'latest.json')
+        checkpoint = run / 'checkpoints' / latest['checkpoint']
+        state = read_json(checkpoint / 'state.json')
+        population = read_json(checkpoint / 'population' / 'metadata.json')
+        islands = read_json(checkpoint / 'population' / 'openevolve_native_metadata.json')
+        print(json.dumps({'run': run.name, 'checkpoint': latest['checkpoint'],
+                          'best': population['best_program_id'],
+                          'island_elite_cells': [len(m) for m in islands['island_feature_maps']],
+                          'tasks': {k: v['stage'] for k, v in state['tasks'].items()}}, indent=2))
         return
     if args.action == 'fork':
         if not args.checkpoint or not args.new_run or Path(args.new_run).name != args.new_run:

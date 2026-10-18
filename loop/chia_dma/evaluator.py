@@ -9,6 +9,19 @@ from .metrics import aggregate, parse
 from .tasks import build, simulate, event
 
 
+def resolve(refs, *, timeout=None):
+    """CHIA supports cache/session callbacks on a single ref, not a ref list.
+
+    Tasks are already dispatched concurrently. Collect individually to unwrap
+    both callbacks and profiler envelopes, retaining one overall deadline.
+    """
+    if not isinstance(refs, list):
+        return get(refs, timeout=timeout)
+    import time
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    return [get(ref, timeout=max(0, deadline - time.monotonic()) if deadline else None) for ref in refs]
+
+
 class DMAEvaluator(ChiaEvaluator):
     def __init__(self, cfg, state, seed, candidate, *, baseline=False, replay=None):
         self.cfg, self.state, self.seed, self.candidate = cfg, state, seed, candidate
@@ -28,7 +41,7 @@ class DMAEvaluator(ChiaEvaluator):
         # CHIA get() unwraps profiler envelopes and cache/session callbacks.
         from types import SimpleNamespace
         import ray
-        self._ray = SimpleNamespace(get=get, cancel=ray.cancel)
+        self._ray = SimpleNamespace(get=resolve, cancel=ray.cancel)
 
     def tag(self, operation):
         from .config import digest, frozen
@@ -57,7 +70,7 @@ class DMAEvaluator(ChiaEvaluator):
         import ray
         refs = [self.dispatch_run(name) for name in self.correctness]
         try:
-            results = await asyncio.to_thread(get, refs, timeout=self.timeout)
+            results = await asyncio.to_thread(resolve, refs, timeout=self.timeout)
             self.gate_records = {name: parse(name, result, self.cfg) for name, result in zip(self.correctness, results)}
         except Exception as error:
             return EvaluationResult({'combined_score': 0.0, 'validity': 0}, {'error': str(error), 'failure_stage': 'correctness'})

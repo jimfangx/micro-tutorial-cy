@@ -6,6 +6,9 @@ python: ./.venv/bin/python
 chia: /scratch/jfx/chia-tutorial-chia
 skydiscover: ./.deps/evolve-flows/skydiscover
 evolve_flows: ./.deps/evolve-flows
+dependencies:
+  evolve_flows_url: https://github.com/ucb-bar/evolve-flows.git
+  evolve_flows_revision: 62d271304d4675c21b946e327bf542a1f62c1012
 runtime:
   conda: ../.conda-env
   # This session predates the docker group addition; sg activates membership.
@@ -14,6 +17,7 @@ runtime:
   image_base: ubuntu:24.04
   cpus_per_build: 8
   memory: 24g
+  pids_limit: 2048
   ray_address: null  # null starts a local CHIA/Ray scheduler
   ray_cpus: 12
   generation_slots: 2
@@ -22,7 +26,7 @@ runtime:
   task_timeout_seconds: 7200
   cache_gb: 4
   environment:
-    JAVA_TOOL_OPTIONS: -Xmx8G -Xss8M -Djava.io.tmpdir=/tmp -Duser.home=/home/ray
+    JAVA_TOOL_OPTIONS: -XX:ActiveProcessorCount=8 -Xmx8G -Xss8M -Djava.io.tmpdir=/tmp -Duser.home=/home/ray
     COURSIER_CACHE: /workspace/.coursier/cache
 agent:
   backend: antigravity  # antigravity | claude | codex

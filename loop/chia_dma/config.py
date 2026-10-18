@@ -18,6 +18,11 @@ def digest(value):
     return hashlib.sha256(data).hexdigest()
 
 
+def implementation_hash():
+    paths = [ROOT / 'loop.py', ROOT / 'Dockerfile', *sorted((ROOT / 'chia_dma').glob('*.py'))]
+    return digest({str(p.relative_to(ROOT)): digest(p.read_bytes()) for p in paths})
+
+
 def load(path=ROOT / 'config.yaml'):
     path = Path(path).resolve()
     cfg = yaml.safe_load(os.path.expandvars(path.read_text()))
@@ -37,6 +42,7 @@ def load(path=ROOT / 'config.yaml'):
             raise ValueError(f'{key} must be positive')
     if cfg['search']['num_islands'] < 2:
         raise ValueError('At least two islands are required')
+    cfg['_implementation_hash'] = implementation_hash()
     cfg['_config_file'] = str(path)
     return cfg
 

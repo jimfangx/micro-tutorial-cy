@@ -46,7 +46,7 @@ def parse(name, result, cfg):
             if any(row.get(k, 0) <= 0 for k in ('bytes', 'cpu_cycles', 'dma_cycles', 'op_cycles', 'setup_cycles')):
                 raise ValueError('Incomplete DMA latency measurement')
             row['bandwidth_bytes_per_cycle'] = row['bytes'] / row['dma_cycles']
-            row['active_bandwidth_bytes_per_cycle'] = row['bytes'] / row['op_cycles']
+            row['operation_bandwidth_bytes_per_cycle'] = row['bytes'] / row['op_cycles']
         return {'copies': rows}
     if name.startswith('wrapper-'):
         records = re.findall(r'^DMA wrapper PASS .*$', text, re.M)

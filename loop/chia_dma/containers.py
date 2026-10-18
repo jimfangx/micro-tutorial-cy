@@ -58,8 +58,9 @@ def container(cfg, mounts, *, agent=False):
         # Do not mount ROOT wholesale: it contains the archive. Only code/deps.
         common = [(conda, conda, 'ro'), (str(ROOT / 'chia_dma'), '/opt/loop/chia_dma', 'ro'),
                   (cfg['chia'], '/opt/chia', 'ro')]
-        options = ['--cpus=' + str(cfg['runtime']['cpus_per_build']), '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-                   '--pids-limit=512', '--init', f'--memory={cfg["runtime"]["memory"]}',
+        affinity = sorted(os.sched_getaffinity(0))[:cfg['runtime']['cpus_per_build']]
+        options = ['--cpuset-cpus=' + ','.join(map(str, affinity)), '--cpus=' + str(cfg['runtime']['cpus_per_build']), '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+                   '--pids-limit=' + str(cfg['runtime']['pids_limit']), '--init', f'--memory={cfg["runtime"]["memory"]}',
                    '--tmpfs /tmp:rw,exec,mode=1777', '--tmpfs /home/ray:rw,exec,mode=1777',
                    f'--user {os.getuid()}:{os.getgid()}',
                    '--env HOME=/home/ray', '--env PYTHONPATH=/opt/chia:/opt/loop',
@@ -86,6 +87,9 @@ def container(cfg, mounts, *, agent=False):
 
 def run_worker(cfg, action, request, mounts, *, agent=False):
     from .artifacts import write_json, read_json
+    from .config import implementation_hash
+    if cfg.get('_implementation_hash') != implementation_hash():
+        raise RuntimeError('Loop/evaluator code changed during the experiment')
     Path(cfg['storage'], 'tmp').mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=action + '-', dir=Path(cfg['storage']) / 'tmp') as folder:
         folder = Path(folder)
@@ -118,7 +122,7 @@ def agent_mounts(cfg, private_home):
         raise RuntimeError(f'Authenticate {backend} first; missing credentials directory {credentials}')
     # Avoid sharing provider conversations across unrelated branches.
     shutil.copytree(credentials, private_home, symlinks=False,
-                    ignore=shutil.ignore_patterns('conversations', 'sessions', 'projects', 'logs', '*.log', 'tmp', 'history.jsonl', 'shell_snapshots'))
+                    ignore=shutil.ignore_patterns('conversations', 'sessions', 'projects', 'logs', '*.log', 'tmp', 'history.jsonl', 'shell_snapshots', '*.sock', 'app-server-control', 'app-server-daemon'))
     if backend == 'antigravity':
         import json
         settings_file = Path(private_home) / 'antigravity-cli' / 'settings.json'
