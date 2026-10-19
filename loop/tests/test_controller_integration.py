@@ -18,11 +18,11 @@ from chia_dma.artifacts import (
     write_json,
     validate_integration,
 )
-from chia_dma.state import State, complete
+from chia_dma.state import State, complete, proposal
 from chia_dma.search import create_controller
 from chia_dma.adapter import CLIClient, ParentContext
 from chia_dma.evaluation import DMAEvaluator
-from chia_dma.runtime import cache_hit, from_cache, has_proposal, from_proposal
+from chia_dma.runtime import cache_hit, from_cache
 
 
 @ray.remote(num_cpus=0)
@@ -117,6 +117,9 @@ def flow(tmp_path, monkeypatch, request):
 
     @ChiaFunction(resources={"generation": 1})
     def generate(cfg, sql, task):
+        saved = proposal(sql, task["id"], remote=True)
+        if saved:
+            return saved
         ray.get(counts.add.remote("generate"))
         if ray.get(counts.enter.remote()):
             for _ in range(250):
@@ -168,10 +171,10 @@ def flow(tmp_path, monkeypatch, request):
     monkeypatch.setattr(adapter, "generate", generate)
     monkeypatch.setattr(tasks, "build", build)
     monkeypatch.setattr(tasks, "simulate", simulate)
-    monkeypatch.setattr(
-        evaluation,
-        "aggregate",
-        lambda records, reference, cfg, source: (
+
+    def aggregate(records, reference, cfg, source):
+        assert set(reference) == set(records)
+        return (
             {
                 "validity": 1,
                 "combined_score": 1.0,
@@ -179,8 +182,9 @@ def flow(tmp_path, monkeypatch, request):
                 "dma_bytes_per_cycle": 1.0,
             },
             {},
-        ),
-    )
+        )
+
+    monkeypatch.setattr(evaluation, "aggregate", aggregate)
     start_collector(log_dir=str(tmp_path / "profile"))
     reset_profiler()
     cache = start_cache(
@@ -190,8 +194,6 @@ def flow(tmp_path, monkeypatch, request):
     for name in ("build", "simulate"):
         bypass.set_cond(name, cache_hit)
         bypass.set_provider(name, from_cache)
-    bypass.set_cond("generate", has_proposal)
-    bypass.set_provider("generate", from_proposal)
     state = State(cfg, run)
     parent = Program(
         id="seed-dma",
@@ -204,6 +206,7 @@ def flow(tmp_path, monkeypatch, request):
     evaluator = DMAEvaluator(cfg, state, seed)
     result = evaluator.evaluate(parent.solution)
     assert result.metrics["validity"] == 1, state.sql.query("SELECT * FROM benchmarks")
+    assert not (run / "reference.json").exists()
     parent.metrics = result.metrics
     for island in (0, 1):
         p = Program(**parent.to_dict())
@@ -438,9 +441,78 @@ def test_completed_evaluation_before_admission_recovers_from_sql_without_generat
         restored.close()
 
 
+def test_online_candidate_fork_restores_full_state_and_continues_independently(flow):
+    from chia_dma.artifacts import RunLock
+    from chia_dma.state import fork
+
+    cfg, state, seed, evaluator, counts, cache, tmp_path = flow
+    cfg["agent"]["backend"] = "codex"
+    controller = create_controller(cfg, state, evaluator)
+    target = tmp_path / "other-copy/loop/experiments/branch"
+    write_json(state.run / "run.json", {"run_id": state.run.name, "seed": str(seed)})
+
+    async def branch_while_running():
+        await controller.run_discovery(
+            1, 1, checkpoint_callback=state.checkpoint, retry_times=1
+        )
+        selected = state.requests()[-1]["id"]
+        checkpoint = read_json(state.run / "latest.json")["checkpoint"]
+        continuing = asyncio.create_task(
+            controller.run_discovery(
+                2, 3, checkpoint_callback=state.checkpoint, retry_times=1
+            )
+        )
+        for _ in range(500):
+            if get(counts.read.remote())[0]["generate"] >= 2:
+                break
+            await asyncio.sleep(0.01)
+        assert not continuing.done()
+        await asyncio.to_thread(fork, state.run, None, target, candidate=selected)
+        await continuing
+        return selected, checkpoint
+
+    with RunLock(state.run):
+        selected, checkpoint = asyncio.run(branch_while_running())
+    parent_requests = state.requests()
+    parent_latest = (state.run / "latest.json").read_bytes()
+    child = State(cfg, target)
+    try:
+        assert read_json(target / "latest.json")["checkpoint"] == checkpoint
+        assert child.admitted == {"seed-dma", selected} and not child.pending()
+        assert child.benchmarks("seed-dma") == state.benchmarks("seed-dma")
+        assert set(child.population.programs) == {
+            p.stem
+            for p in (
+                state.run / "checkpoints" / checkpoint / "population/programs"
+            ).glob("*.json")
+        }
+        assert len(child.requests()) == 2 and len(parent_requests) == 5
+        native = Path("population/openevolve_native_metadata.json")
+        assert (target / "checkpoints" / checkpoint / native).read_bytes() == (
+            state.run / "checkpoints" / checkpoint / native
+        ).read_bytes()
+        resumed = create_controller(cfg, child, DMAEvaluator(cfg, child, seed))
+        asyncio.run(
+            resumed.run_discovery(
+                child.population.last_iteration + 1,
+                1,
+                checkpoint_callback=child.checkpoint,
+                retry_times=1,
+            )
+        )
+        assert len(child.requests()) == 3
+        assert state.requests() == parent_requests
+        assert (state.run / "latest.json").read_bytes() == parent_latest
+    finally:
+        child.close()
+
+
 def test_native_migration_preserves_original_candidate_ids(flow):
     cfg, state, seed, evaluator, counts, cache, tmp_path = flow
     cfg["agent"]["backend"] = "codex"
+    # Prefer unique children over the seed already present on both islands.
+    for program in state.population.programs.values():
+        program.metrics["combined_score"] = 0.5
     controller = create_controller(cfg, state, evaluator)
     asyncio.run(
         controller.run_discovery(

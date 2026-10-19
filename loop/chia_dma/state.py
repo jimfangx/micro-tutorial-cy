@@ -180,6 +180,14 @@ class State:
         value = self.sql.query_value("SELECT metrics FROM proposals WHERE id=?", (cid,))
         return json.loads(value) if value else None
 
+    def benchmarks(self, cid):
+        return {
+            row["name"]: json.loads(row["metrics"])
+            for row in self.sql.query(
+                "SELECT name,metrics FROM benchmarks WHERE candidate=?", (cid,)
+            )
+        }
+
     def pending(self):
         return [
             r
@@ -209,7 +217,10 @@ class State:
     def checkpoint(self, iteration=0):
         root = self.run / "checkpoints"
         root.mkdir(exist_ok=True)
-        name = f"{iteration:08d}-" + uuid.uuid4().hex[:8]
+        sequence = 1 + max(
+            (int(p.name.split("-")[0]) for p in root.glob("[0-9]*")), default=-1
+        )
+        name = f"{sequence:08d}-" + uuid.uuid4().hex[:8]
         temp = root / ("." + name)
         temp.mkdir()
         self.population.save(
@@ -238,8 +249,19 @@ class State:
         self.sql.close()
 
 
-def fork(origin, checkpoint, target):
+def fork(origin, checkpoint, target, *, candidate=None):
     """Keep the native population and only SQL history visible at this checkpoint."""
+    if target.resolve().is_relative_to(origin.resolve()):
+        raise ValueError("Fork destination must be outside the source experiment")
+    if candidate:
+        history = sorted((origin / "checkpoints").glob("[!.]*/state.json"))
+        checkpoint = next(
+            (p.parent.name for p in history if candidate in read_json(p)["admitted"]),
+            None,
+        )
+        if checkpoint is None:
+            raise ValueError("No committed checkpoint contains candidate: " + candidate)
+    checkpoint = checkpoint or read_json(origin / "latest.json")["checkpoint"]
     cp = origin / "checkpoints" / checkpoint
     envelope = read_json(cp / "state.json")
     known = envelope["requests"]

@@ -9,8 +9,8 @@ import time
 import pytest
 import ray
 from chia.base.ChiaFunction import ChiaFunction, get
-from chia_dma.config import ALLOWLIST
-from chia_dma.runtime import render
+from chia_dma.config import ALLOWLIST, ROOT
+from chia_dma.runtime import Runtime, render
 from native_fixture import native_ssh
 
 
@@ -45,21 +45,6 @@ def attach(cfg):
     ray.init(
         address=cfg["runtime"]["ray_address"],
         namespace="native-proof",
-        runtime_env={
-            "env_vars": {
-                "PYTHONPATH": ":".join(
-                    [
-                        "/opt/loop",
-                        "/opt/chia",
-                        "/opt/skydiscover",
-                        str(Path(__file__).resolve().parents[1]),
-                        cfg["chia"],
-                        cfg["skydiscover"],
-                        cfg["evolve_flows"],
-                    ]
-                )
-            }
-        },
     )
 
 
@@ -197,17 +182,10 @@ def test_native_generation_parent_separation_forbidden_writes_and_serial_reuse(
                 (results[1], results[2]),
             ]
         )
-        from chia.base.bypass import Bypass
-        from chia_dma.runtime import has_proposal, from_proposal
+        from chia_dma.adapter import generate
 
-        bypass = Bypass(cfg["_config_file"])
-        bypass.set_cond("generate", has_proposal)
-        bypass.set_provider("generate", from_proposal)
-
-        @ChiaFunction(resources={"generation": 1})
-        def generate(cfg, sql, task):
-            raise AssertionError("Completed proposal called the LLM again")
-
+        # A completed proposal returns before even reading the missing parent
+        # field; reaching the agent path would fail this task.
         recovered = get(generate.chia_remote(cfg, state.sql, {"id": "parent-A"}))
         assert recovered["source"] == state.proposal("parent-A")["source"]
         state.close()
@@ -258,31 +236,61 @@ def test_native_build_simulation_worker_placement(native_ssh):
     cfg, run, seed, path = cluster(cfg, base, "pools", pools=True)
     try:
         chia(cfg, "up", path)
-        attach(cfg)
+        with Runtime(cfg, run):
 
-        @ChiaFunction()
-        def probe():
-            import os
-            from pathlib import Path
+            @ChiaFunction()
+            def probe():
+                import importlib
+                import os
+                from pathlib import Path
 
-            p = Path("/home/ray/dma-build/frozen")
-            return os.readlink("/proc/self/ns/mnt"), (
-                p.read_text() if p.exists() else None
+                p = Path("/home/ray/dma-build/frozen")
+                return (
+                    os.readlink("/proc/self/ns/mnt"),
+                    (p.read_text() if p.exists() else None),
+                    {
+                        name: importlib.import_module(name).__file__
+                        for name in (
+                            "chia.base.ChiaFunction",
+                            "chia_dma.adapter",
+                            "skydiscover.config",
+                        )
+                    },
+                )
+
+            build = get(probe.options(resources={"chipyard": 1}).chia_remote())
+            simulation = get(
+                probe.options(resources={"verilator_run": 1}).chia_remote()
             )
-
-        build = get(probe.options(resources={"chipyard": 1}).chia_remote())
-        simulation = get(probe.options(resources={"verilator_run": 1}).chia_remote())
-        assert (
-            build[0] != simulation[0]
-            and build[1] == "preserved source"
-            and simulation[1] is None
-        )
-        assert ray.cluster_resources()["generation"] == 2
-        handles = [simulation_probe.chia_remote(mark) for mark in ("A", "B")]
-        assert [get(h).strip() for h in handles] == [
-            "BUILD_A\nINPUT_A",
-            "BUILD_B\nINPUT_B",
-        ]
+            generation = get(probe.options(resources={"generation": 1}).chia_remote())
+            head = get(
+                probe.options(resources={"node:__internal_head__": 0.001}).chia_remote()
+            )
+            assert (
+                build[0] != simulation[0]
+                and build[1] == "preserved source"
+                and simulation[1] is None
+            )
+            assert head[2]["chia_dma.adapter"] == str(ROOT / "chia_dma/adapter.py")
+            assert head[2]["chia.base.ChiaFunction"] == str(
+                Path(cfg["chia"]) / "chia/base/ChiaFunction.py"
+            )
+            for worker in (build, simulation, generation):
+                assert worker[2]["chia_dma.adapter"] == "/opt/loop/chia_dma/adapter.py"
+                assert (
+                    worker[2]["chia.base.ChiaFunction"]
+                    == "/opt/chia/chia/base/ChiaFunction.py"
+                )
+                assert (
+                    worker[2]["skydiscover.config"]
+                    == "/opt/skydiscover/skydiscover/config.py"
+                )
+            assert ray.cluster_resources()["generation"] == 2
+            handles = [simulation_probe.chia_remote(mark) for mark in ("A", "B")]
+            assert [get(h).strip() for h in handles] == [
+                "BUILD_A\nINPUT_A",
+                "BUILD_B\nINPUT_B",
+            ]
     finally:
         ray.shutdown()
         chia(cfg, "down", path)

@@ -26,7 +26,7 @@ def parse(result, cfg, seed=None):
     }
 
 
-def aggregate(records, reference, cfg, source, hardware=None):
+def aggregate(records, reference, cfg, source):
     vector = {}
     values = []
     timed_bytes = timed_cycles = 0
@@ -74,13 +74,6 @@ def aggregate(records, reference, cfg, source, hardware=None):
         or sum(w for _, w in values) <= 0
     ):
         raise ValueError("Invalid workload weights")
-    for metric, limit in (("area", "max_area"), ("delay", "max_delay")):
-        maximum = cfg["fitness"][limit]
-        if maximum is not None:
-            if hardware is None or metric not in hardware or hardware[metric] > maximum:
-                raise ValueError(
-                    f"Reliable {metric} estimate required and must satisfy {limit}"
-                )
     score = math.exp(
         sum(w * math.log(s) for s, w in values) / sum(w for _, w in values)
     )

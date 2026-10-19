@@ -11,7 +11,7 @@ import ray
 from chia.base.ChiaFunction import get, chia_cancel
 from skydiscover.evaluation.evaluation_result import EvaluationResult
 from chia_dma import tasks
-from chia_dma.artifacts import read_json, write_json
+from chia_dma.artifacts import read_json
 from chia_dma.config import digest, frozen
 from chia_dma.metrics import aggregate, parse
 
@@ -108,9 +108,7 @@ class DMAEvaluator:
                     )
                     records[name] = parse(asdict(result), self.cfg, self.tree)
             reference = (
-                records
-                if cid == "seed-dma"
-                else read_json(self.state.run / "reference.json")
+                records if cid == "seed-dma" else self.state.benchmarks("seed-dma")
             )
             if cid == "seed-dma":
                 for name, row in records.items():
@@ -122,8 +120,6 @@ class DMAEvaluator:
                         ):
                             raise ValueError("CPU/DMA outputs disagree")
             metrics, vector = aggregate(records, reference, self.cfg, source)
-            if cid == "seed-dma":
-                write_json(self.state.run / "reference.json", records)
         except ValueError as error:
             metrics, vector = {"validity": 0, "combined_score": 0.0}, {
                 "error": str(error)

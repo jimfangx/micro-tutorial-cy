@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install loop-only dependencies using the paths/revisions in config.yaml."""
+"""Install loop-only dependencies pinned in backend.yaml."""
 
 # Setup steps: (1) clone/check out pinned CHIA; (2) clone/check out evolve-flows
 # and initialize its pinned SkyDiscover submodule; (3) create a loop-local venv
@@ -15,37 +15,17 @@ import venv
 from chia_dma.config import load
 
 cfg = load()
-chia = Path(cfg["chia"])
-if not (chia / ".git").exists():
+for name in ("chia", "evolve_flows"):
+    target = Path(cfg[name])
+    if not (target / ".git").exists():
+        subprocess.run(
+            ["git", "clone", cfg["dependencies"][name + "_url"], str(target)],
+            check=True,
+        )
     subprocess.run(
-        ["git", "clone", cfg["dependencies"]["chia_url"], str(chia)], check=True
-    )
-subprocess.run(
-    ["git", "-C", str(chia), "checkout", cfg["dependencies"]["chia_revision"]],
-    check=True,
-)
-target = Path(cfg["evolve_flows"])
-if not (target / ".git").exists():
-    subprocess.run(
-        [
-            "git",
-            "clone",
-            "--recurse-submodules",
-            cfg["dependencies"]["evolve_flows_url"],
-            str(target),
-        ],
+        ["git", "-C", str(target), "checkout", cfg["dependencies"][name + "_revision"]],
         check=True,
     )
-subprocess.run(
-    [
-        "git",
-        "-C",
-        str(target),
-        "checkout",
-        cfg["dependencies"]["evolve_flows_revision"],
-    ],
-    check=True,
-)
 subprocess.run(
     ["git", "-C", str(target), "submodule", "update", "--init", "--recursive"],
     check=True,

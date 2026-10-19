@@ -1,4 +1,4 @@
-"""One configuration entry point, shared by the CLI and every worker."""
+"""Tutorial controls layered over fixed backend settings."""
 
 from pathlib import Path
 import copy
@@ -27,13 +27,19 @@ def digest(value):
 # Loads YAML, expands environment variables, resolves paths, and validates settings.
 def load(path=ROOT / "config.yaml"):
     path = Path(path).resolve()
-    cfg = yaml.safe_load(os.path.expandvars(path.read_text()))
+    cpus = str(len(os.sched_getaffinity(0)))
+    cfg, cluster = [
+        yaml.safe_load(os.path.expandvars(p.read_text().replace("${CPUS}", cpus)))
+        for p in (ROOT / "backend.yaml", path)
+    ]
+    settings = {key: cluster.pop(key) for key in ("agent", "search", "runtime")}
+    merge(cfg, dict(**settings, cluster=cluster))
     for key in ("source", "storage", "chia", "skydiscover", "evolve_flows"):
-        cfg[key] = str((path.parent / cfg[key]).resolve())
-    cfg["python"] = os.path.abspath(path.parent / cfg["python"])
-    cfg["runtime"]["conda"] = str((path.parent / cfg["runtime"]["conda"]).resolve())
+        cfg[key] = str((ROOT / cfg[key]).resolve())
+    cfg["python"] = os.path.abspath(ROOT / cfg["python"])
+    cfg["runtime"]["conda"] = str((ROOT / cfg["runtime"]["conda"]).resolve())
     for backend in cfg["agent"]["backends"].values():
-        backend["credentials"] = str((path.parent / backend["credentials"]).resolve())
+        backend["credentials"] = str((ROOT / backend["credentials"]).resolve())
     generation = cfg["cluster"]["available_node_types"]["generation"]
     if generation["resources"] != {"generation": 1} or generation["num_workers"] < 1:
         raise ValueError(
@@ -56,29 +62,32 @@ def load(path=ROOT / "config.yaml"):
         raise ValueError("At least two islands are required")
     if cfg["search"]["type"] != "openevolve_native":
         raise ValueError("This tutorial uses SkyDiscover openevolve_native")
-    cfg["_config_file"] = str(path)
+    cfg["_config_file"] = str(ROOT / "backend.yaml")
     return cfg
+
+
+def merge(base, updates):
+    for key, value in updates.items():
+        if isinstance(value, dict):
+            merge(base.setdefault(key, {}), value)
+        else:
+            base[key] = value
 
 
 # Selects settings that must remain unchanged when resuming an experiment.
 def frozen(cfg):
     """Backend/model may change on resume; evaluation and search rules may not."""
-    data = copy.deepcopy(cfg)
-    for key in (
-        "agent",
-        "cache",
-        "bypass",
-        "_config_file",
-        "python",
-        "chia",
-        "skydiscover",
-        "evolve_flows",
-        "storage",
-        "source",
-        "cluster",
-    ):
-        data.pop(key, None)
-    data.pop("runtime", None)
+    data = {
+        key: copy.deepcopy(cfg[key])
+        for key in (
+            "dependencies",
+            "hardware",
+            "software",
+            "fitness",
+            "search",
+            "preserve",
+        )
+    }
     data["worker_contract"] = {
         name: {
             "image": node["docker"]["image"],

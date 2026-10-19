@@ -9,7 +9,6 @@ import os
 import sys
 import uuid
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from chia_dma.config import ROOT, load
 from chia_dma.artifacts import RunLock, read_json
 
@@ -22,24 +21,23 @@ def main():
     )
     parser.add_argument("--config", default=str(ROOT / "config.yaml"))
     parser.add_argument("--run", default="run-001")
-    parser.add_argument("--candidate")
-    parser.add_argument("--checkpoint")
-    parser.add_argument("--new-run")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--candidate")
+    selection.add_argument("--checkpoint")
+    parser.add_argument("--new-run", help="New run name or absolute experiment path")
     args = parser.parse_args()
     cfg = load(args.config)
     if os.path.abspath(sys.executable) != cfg["python"]:
         os.execv(
             cfg["python"], [cfg["python"], str(Path(__file__).resolve()), *sys.argv[1:]]
         )
-    for key in ("chia", "skydiscover", "evolve_flows"):
-        sys.path.insert(0, cfg[key])
     from chia_dma.runtime import prepare, Runtime, authenticate, prepare_software
     from chia_dma.state import State, fork
     from chia_dma.evaluation import DMAEvaluator
     from chia_dma.search import run_search
     from skydiscover.search.base_database import Program
 
-    for name in (args.run, args.new_run, args.candidate, args.checkpoint):
+    for name in (args.run, args.candidate, args.checkpoint):
         if name and (Path(name).name != name or name in (".", "..")):
             parser.error("Use simple run/candidate/checkpoint names")
     run = Path(cfg["storage"]) / args.run
@@ -48,8 +46,9 @@ def main():
             parser.error("fork requires --new-run")
         fork(
             run,
-            args.checkpoint or read_json(run / "latest.json")["checkpoint"],
-            run.parent / args.new_run,
+            args.checkpoint,
+            run.parent / Path(args.new_run).expanduser(),
+            candidate=args.candidate,
         )
         return
     if args.action == "status":

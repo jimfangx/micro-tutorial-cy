@@ -13,7 +13,6 @@ from chia.base.cache import get_active_cache, start_cache, stop_cache
 from chia.trace.profiler import start_collector, stop_collector
 from .config import ROOT, ALLOWLIST, digest, frozen
 from .artifacts import git, read_json, snapshot, source_bundle, write_json
-from .state import proposal
 from .tasks import software
 
 
@@ -98,14 +97,6 @@ def from_cache(tag, data_path, *args, **kwargs):
     return value
 
 
-def has_proposal(tag, data_path, cfg, sql, task):
-    return not task.get("auth") and proposal(sql, task["id"]) is not None
-
-
-def from_proposal(tag, data_path, cfg, sql, task):
-    return proposal(sql, task["id"], remote=True)
-
-
 class Runtime:
     """Attach to an existing native cluster; own cache/profiling, not worker lifecycle."""
 
@@ -117,21 +108,6 @@ class Runtime:
         ray.init(
             address=cfg["runtime"]["ray_address"],
             namespace="dma-" + digest(str(self.run))[:24],
-            runtime_env={
-                "env_vars": {
-                    "PYTHONPATH": os.pathsep.join(
-                        [
-                            "/opt/loop",
-                            "/opt/chia",
-                            "/opt/skydiscover",
-                            str(ROOT),
-                            cfg["chia"],
-                            cfg["skydiscover"],
-                            cfg["evolve_flows"],
-                        ]
-                    )
-                }
-            },
         )
         missing = {
             "generation",
@@ -152,8 +128,6 @@ class Runtime:
         for name in ("build", "simulate"):
             bypass.set_cond(name, cache_hit)
             bypass.set_provider(name, from_cache)
-        bypass.set_cond("generate", has_proposal)
-        bypass.set_provider("generate", from_proposal)
         return self
 
     def __exit__(self, *args):
