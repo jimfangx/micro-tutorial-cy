@@ -14,4 +14,5 @@ chia up "$CLUSTER" -y
 JOB="$RUN-$(date +%s)"
 chia job submit --chia-cluster "$CLUSTER" --submission-id "$JOB" --no-wait -- \
   python -u "$PWD/loop.py" resume --run "$RUN"
+printf '%s\n' "$JOB" > "$RUN_DIR/job-id"
 chia job logs --chia-cluster "$CLUSTER" "$JOB" --follow
