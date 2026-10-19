@@ -4,8 +4,6 @@
 source: ..
 # Experiment/seed directory, relative to this configuration.
 storage: ./experiments
-# Loop-local Python executable created by bootstrap.py.
-python: ./.venv/bin/python
 # Pinned CHIA checkout installed by bootstrap.py.
 chia: ./.deps/chia
 # SkyDiscover package inside the evolve-flows submodule.
@@ -18,14 +16,14 @@ dependencies:
   evolve_flows_url: https://github.com/ucb-bar/evolve-flows.git
   # Exact evolve-flows commit, including its SkyDiscover gitlink.
   evolve_flows_revision: 62d271304d4675c21b946e327bf542a1f62c1012
-  # Upstream CHIA repository to clone.
+  # Upstream CHIA Python package source, prepared inside the controller.
   chia_url: https://github.com/ucb-bar/chia.git
-  # Exact CHIA commit; no local compatibility patches are applied.
+  # Exact CHIA Python integration installed inside the controller; no patches.
   chia_revision: a4cedf24b131c459d7f176453d8e0cea97dda796
+  # Additional controller packages; installation stays inside its container.
+  python_packages: [openai==3.35.1, pydantic==2.12.4, pytest==9.1.1, black==26.10.1]
 # CHIA connection and service limits; worker deployment is below.
 runtime:
-  # Activated local toolchain directory, mounted read-only in workers.
-  conda: ../.conda-env
   # Build/run collection deadline per phase, in seconds.
   task_timeout_seconds: 14400
   # CHIA task-output cache capacity, in GB.
@@ -58,7 +56,7 @@ agent:
         extra_cli_args:
         - --effort
         - low
-      # Provider-specific native Docker options; keep credential/binary mounts read-only.
+      # Provider-specific native Docker options; keep credential mounts read-only.
       mounts: []
     # Claude Code worker; its native tools are disabled in favor of BashTool.
     claude:
@@ -75,14 +73,13 @@ agent:
         - --tools
         - ''
         - --strict-mcp-config
-      # Provider-specific native Docker options; keep credential/binary mounts read-only.
+      # Provider-specific native Docker options; keep credential mounts read-only.
       mounts:
-      # Read-only dependency, code, credential, or toolchain bind.
       - --mount 'type=bind,src=${HOME}/.claude.json,dst=/credential-config,readonly'
       # Provider setup commands run in the container private home.
       setup_commands:
       - cp /credential-config /tmp/agent-home/.claude.json
-    # Codex on the upstream CHIA base image with host CLI binaries mounted read-only.
+    # Codex installed inside the upstream Claude image, which supplies Node/npm.
     codex:
       # Host login directory to copy read-only into the worker private home.
       credentials: ${HOME}/.codex
@@ -90,12 +87,9 @@ agent:
       credential_target: /tmp/agent-home/.codex
       # Keyword arguments passed to this native CHIA CLI model class.
       options: {}
-      # Provider-specific native Docker options; keep credential/binary mounts read-only.
-      mounts:
-      # Read-only dependency, code, credential, or toolchain bind.
-      - --mount 'type=bind,src=${HOME}/.local/bin/codex,dst=/usr/local/bin/codex,readonly'
-      # Read-only dependency, code, credential, or toolchain bind.
-      - --mount 'type=bind,src=${HOME}/.codex/packages/standalone/current/bin/codex-code-mode-host,dst=/usr/local/bin/codex-code-mode-host,readonly'
+      # Install the CLI in private container scratch; no host executable mounts.
+      setup_commands:
+      - npm install --prefix /tmp/codex --cache /tmp/npm-cache @openai/codex@0.163.0
 # Native SkyDiscover openevolve_native settings.
 search:
   # Random seed for native search sampling.
@@ -212,8 +206,13 @@ preserve:
   - __pycache__
   - .pytest_cache
   - target
+  - .classpath_cache
+  - .sbt
+  - .ivy2
+  - .coursier
   # Source-relative generated/irrelevant paths excluded from the seed copy.
   exclude_paths:
+  - env.sh
   - software/rocc-dma/build
   - sims/verilator/generated-src
   - sims/verilator/output
@@ -221,29 +220,30 @@ preserve:
   - software/firemarshal/boards/default/linux
 # Fixed CHIA mounts and setup; images, names, scheduling/startup are in config.yaml.
 cluster:
-  # Host toolchain/import environment for native head startup and teardown.
+  # Native CHIA head probes/teardown execute Python inside the controller.
   head_env_commands:
-  # Executable lookup order: mounted toolchain, provider binaries, then system tools.
-  - export PATH=${VENV}/bin:${CONDA}/bin:${CONDA}/riscv-tools/bin:/usr/local/bin:/usr/bin:/bin
-  # Read-only CHIA/tutorial/SkyDiscover package import paths.
-  - export PYTHONPATH=${LOOP}:${CHIA}:${EVOLVE}:${SKY}
+  - python3() { docker exec -i ${HEAD} /home/ray/anaconda3/bin/python "$@"; }
   # Native build, simulation, and generation worker templates.
   available_node_types:
     # Private simulator-build workers; increase container count for parallel builds.
     build:
       # Environment for setup and Ray tasks, including CPU and private-home settings.
       worker_env_commands:
-      # Executable lookup order: mounted toolchain, provider binaries, then system tools.
-      - export PATH=${VENV}/bin:${CONDA}/bin:/home/ray/chipyard/.conda-env/riscv-tools/bin:/usr/local/bin:/usr/bin:/bin
+      # Image-native tools and container-installed provider binaries.
+      - source /home/ray/chipyard/env.sh
+      - export PATH=/home/ray/anaconda3/bin:$PATH
       # Read-only CHIA/tutorial/SkyDiscover package import paths.
-      - export PYTHONPATH=/opt/loop:/opt/chia:/opt/skydiscover
+      - export PYTHONPATH=/opt/dma-python:/opt/loop:/opt/chia:/opt/skydiscover
       # Ray CPU budget for this worker, in logical CPUs.
       - export CHIA_CPUS=${CPUS}
       # Native setup commands; project writes stay in the private worker checkout.
       worker_setup_commands:
+      - python -m pip install --disable-pip-version-check scons==4.11.1
       - mkdir -p /home/ray/dma-build
       - cp -a ${SEED}/tree/. /home/ray/dma-build/
       - chmod -R u+w /home/ray/dma-build
+      - ln -sfnT /home/ray/chipyard/.sbt /home/ray/dma-build/.sbt
+      - ln -sfnT /home/ray/chipyard/.ivy2 /home/ray/dma-build/.ivy2
       # Native Docker worker configuration; CHIA supplies ordinary host networking.
       docker:
         # Let native chia up fetch the pinned upstream image.
@@ -259,21 +259,15 @@ cluster:
         # Fixed 32 GiB JVM heap, stack size, and private temporary/home directories.
         - --env 'JAVA_TOOL_OPTIONS=-Xmx32G -Xss8M -Djava.io.tmpdir=/tmp
           -Duser.home=/home/ray'
-        # Dependency-cache path inside the private build checkout.
-        - --env COURSIER_CACHE=/home/ray/dma-build/.coursier/cache
-        # Read-only dependency, code, credential, or toolchain bind.
-        - --mount 'type=bind,src=${CONDA},dst=${CONDA},readonly'
-        # Pinned loop Python packages, mounted read-only to match the head environment.
-        - --mount 'type=bind,src=${VENV},dst=${VENV},readonly'
-        # Read-only dependency, code, credential, or toolchain bind.
+        # Reuse dependency downloads shipped in the build image.
+        - --env COURSIER_CACHE=/home/ray/.cache/coursier/v1
+        # Python packages installed inside the controller's Docker volume.
+        - --mount 'type=volume,src=${PYTHON_VOLUME},dst=/opt/dma-python,readonly'
         - --mount 'type=bind,src=${LOOP}/chia_dma,dst=/opt/loop/chia_dma,readonly'
-        # Read-only dependency, code, credential, or toolchain bind.
         - --mount 'type=bind,src=${CHIA},dst=/opt/chia,readonly'
-        # Read-only dependency, code, credential, or toolchain bind.
         - --mount 'type=bind,src=${SKY},dst=/opt/skydiscover,readonly'
         # Trusted evaluator output directory; never mounted writable in generation.
         - --mount 'type=bind,src=${RUN},dst=${RUN}'
-        # Read-only dependency, code, credential, or toolchain bind.
         - --mount 'type=bind,src=${SEED},dst=${SEED},readonly'
         # Maximum image pull time, in seconds (the build image is large).
         pull_timeout: 7200
@@ -281,10 +275,10 @@ cluster:
     simulation:
       # Environment for setup and Ray tasks, including CPU and private-home settings.
       worker_env_commands:
-      # Executable lookup order: mounted toolchain, provider binaries, then system tools.
-      - export PATH=${VENV}/bin:/usr/local/bin:${CONDA}/bin:/usr/bin:/bin
+      # Image-native tools and container-installed provider binaries.
+      - export PATH=/home/ray/anaconda3/bin:/usr/local/bin:/usr/bin:/bin
       # Read-only CHIA/tutorial/SkyDiscover package import paths.
-      - export PYTHONPATH=/opt/loop:/opt/chia:/opt/skydiscover
+      - export PYTHONPATH=/opt/dma-python:/opt/loop:/opt/chia:/opt/skydiscover
       # Ray CPU budget for this worker, in logical CPUs.
       - export CHIA_CPUS=${CPUS}
       # Native Docker worker configuration; CHIA supplies ordinary host networking.
@@ -297,19 +291,13 @@ cluster:
         - --shm-size=2g
         # Per-process soft/hard open-file descriptor limits.
         - --ulimit nofile=65536:65536
-        # Read-only dependency, code, credential, or toolchain bind.
-        - --mount 'type=bind,src=${CONDA},dst=${CONDA},readonly'
-        # Pinned loop Python packages, mounted read-only to match the head environment.
-        - --mount 'type=bind,src=${VENV},dst=${VENV},readonly'
-        # Read-only dependency, code, credential, or toolchain bind.
+        # Python packages installed inside the controller's Docker volume.
+        - --mount 'type=volume,src=${PYTHON_VOLUME},dst=/opt/dma-python,readonly'
         - --mount 'type=bind,src=${LOOP}/chia_dma,dst=/opt/loop/chia_dma,readonly'
-        # Read-only dependency, code, credential, or toolchain bind.
         - --mount 'type=bind,src=${CHIA},dst=/opt/chia,readonly'
-        # Read-only dependency, code, credential, or toolchain bind.
         - --mount 'type=bind,src=${SKY},dst=/opt/skydiscover,readonly'
         # Trusted evaluator output directory; never mounted writable in generation.
         - --mount 'type=bind,src=${RUN},dst=${RUN}'
-        # Read-only dependency, code, credential, or toolchain bind.
         - --mount 'type=bind,src=${SEED},dst=${SEED},readonly'
         # Maximum image pull time, in seconds (the build image is large).
         pull_timeout: 7200
@@ -317,10 +305,10 @@ cluster:
     generation:
       # Environment for setup and Ray tasks, including CPU and private-home settings.
       worker_env_commands:
-      # Executable lookup order: mounted toolchain, provider binaries, then system tools.
-      - export PATH=${VENV}/bin:${CONDA}/bin:${CONDA}/riscv-tools/bin:/home/ray/.local/bin:/usr/local/bin:/usr/bin:/bin
+      # Image-native tools and container-installed provider binaries.
+      - export PATH=/tmp/codex/node_modules/.bin:/home/ray/.local/bin:/home/ray/anaconda3/bin:/usr/local/bin:/usr/bin:/bin
       # Read-only CHIA/tutorial/SkyDiscover package import paths.
-      - export PYTHONPATH=/opt/loop:/opt/chia:/opt/skydiscover
+      - export PYTHONPATH=/opt/dma-python:/opt/loop:/opt/chia:/opt/skydiscover
       # Ray CPU budget for this worker, in logical CPUs.
       - export CHIA_CPUS=2
       # Writable private CLI home in tmpfs; image tools remain read-only.
@@ -352,15 +340,10 @@ cluster:
         - --tmpfs /tmp:rw,exec,mode=1777
         # Run generation as the host UID/GID owning its two writable files.
         - --user ${UID}:${GID}
-        # Read-only dependency, code, credential, or toolchain bind.
-        - --mount 'type=bind,src=${CONDA},dst=${CONDA},readonly'
-        # Pinned loop Python packages, mounted read-only to match the head environment.
-        - --mount 'type=bind,src=${VENV},dst=${VENV},readonly'
-        # Read-only dependency, code, credential, or toolchain bind.
+        # Python packages installed inside the controller's Docker volume.
+        - --mount 'type=volume,src=${PYTHON_VOLUME},dst=/opt/dma-python,readonly'
         - --mount 'type=bind,src=${LOOP}/chia_dma,dst=/opt/loop/chia_dma,readonly'
-        # Read-only dependency, code, credential, or toolchain bind.
         - --mount 'type=bind,src=${CHIA},dst=/opt/chia,readonly'
-        # Read-only dependency, code, credential, or toolchain bind.
         - --mount 'type=bind,src=${SKY},dst=/opt/skydiscover,readonly'
         # Preserved project input mounted read-only.
         - --mount 'type=bind,src=${SEED}/tree,dst=/workspace,readonly'

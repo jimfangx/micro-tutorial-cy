@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import time
 import pytest
@@ -67,15 +68,7 @@ def flow(tmp_path, monkeypatch, request):
         _node_ip_address="127.0.0.1",
         runtime_env={
             "env_vars": {
-                "PYTHONPATH": ":".join(
-                    [
-                        str(root),
-                        str(root / "tests"),
-                        cfg["chia"],
-                        cfg["skydiscover"],
-                        cfg["evolve_flows"],
-                    ]
-                )
+                "PYTHONPATH": os.environ["PYTHONPATH"] + ":" + str(root / "tests")
             }
         },
     )

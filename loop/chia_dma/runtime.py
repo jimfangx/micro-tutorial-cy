@@ -52,11 +52,8 @@ def render(cfg, run, seed):
         LOOP=str(ROOT),
         RUN=str(run),
         SEED=str(seed),
-        CONDA=cfg["runtime"]["conda"],
-        VENV=str(Path(cfg["python"]).parent.parent),
         CHIA=cfg["chia"],
         SKY=cfg["skydiscover"],
-        EVOLVE=cfg["evolve_flows"],
         NAME=Path(run).name,
         UID=str(os.getuid()),
         GID=str(os.getgid()),
@@ -64,6 +61,8 @@ def render(cfg, run, seed):
         CREDENTIALS=backend["credentials"],
         CREDENTIAL_TARGET=backend["credential_target"],
     )
+    values["HEAD"] = expand(cfg["cluster"]["docker"]["container_name"], values)
+    values["PYTHON_VOLUME"] = values["HEAD"] + "-python"
     data = expand(cfg["cluster"], values)
     template = data["available_node_types"].pop("generation")
     for index in range(template["num_workers"]):

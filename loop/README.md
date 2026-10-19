@@ -20,30 +20,40 @@ candidate, checkpoint, and destination names with your own.
 
 ## Set up and run
 
-Use an initialized Chipyard checkout with its RISC-V/Java/Verilator environment,
-Docker access, passwordless SSH to the configured hosts, and a valid host login
-for the selected provider. For a new machine, follow the repository's
-[Chipyard setup instructions](../docs/Chipyard-Basics/Initial-Repo-Setup.rst)
-(`./build-setup.sh riscv-tools`) first. `bootstrap.py` installs loop dependencies;
-it does not initialize Chipyard or configure SSH/provider logins.
+This section creates a new experiment. For an existing checkpoint, skip to
+[restore without Chipyard source setup](#restore-in-a-fresh-github-clone).
+
+The host needs Bash, Docker access, and passwordless SSH to the configured
+hosts with Docker available to that SSH user. No host Python, CHIA, Conda,
+Java, sbt, Verilator, RISC-V compiler, or agent CLI installation is used.
+The example is single-host: source/state mounts and Docker volumes must be
+available on that host. Authenticate your selected provider using its container
+CLI and retain its login files at the credential paths in `backend.yaml`.
+
+`container.sh` starts a controller from the published CHIA base image. Bootstrap
+installs the pinned Python integrations and Docker/SSH client tools **inside
+that container**. Workers use published CHIA images and a read-only package
+volume. No derived image is built.
 
 ```sh
-source env.sh
-# PyYAML is needed to read the configuration before bootstrapping.
-python -m pip install 'PyYAML==6.0.3'
-python loop/bootstrap.py
-# Once per fresh Chipyard environment: CHIA's host dependencies, plus the
-# lightweight SkyDiscover dependencies used by this tutorial. The loop venv
-# inherits these; installing Ray here also provides .conda-env/bin/ray.
-python -m pip install -e loop/.deps/chia numpy tqdm python-dotenv
+RUN=run-001
+./loop/container.sh "$RUN" bootstrap
+# A NEW experiment needs initialized generator/benchmark source inputs.
+# For a fresh full checkout, initialize source submodules inside the container:
+./loop/container.sh "$RUN" bash -c '
+  git config --global url.https://github.com/.insteadOf git@github.com:
+  bash scripts/init-submodules-no-riscv-tools.sh
+  git submodule update --init tests/embench-iot
+'
 ```
 
-The validated host uses Python 3.10 and Ray 2.54.0. The loop venv inherits the
-activated Chipyard environment, which must be at `.conda-env` (or the fixed
-`backend.yaml` toolchain path). Workers mount that environment read-only, so the
-head and workers use matching Python/Ray versions.
-Bootstrap supplies the driver's installed dependencies; native CHIA
-`head_env_commands` and `worker_env_commands` supply task import paths.
+Skip source initialization when the required submodules are already populated.
+That Git URL setting lives in the controller's private home.
+Do not run Chipyard `build-setup.sh` or source a host `env.sh`: CHIA's build image
+supplies the toolchain. The controller and workers use image Python 3.10.19 and
+Ray 2.54.0; build tools come from the build image's own Chipyard environment.
+Native YAML supplies head/worker import paths. SkyDiscover is provided by the
+pinned evolve-flows submodule, installed by bootstrap inside the container.
 
 Choose `agent.backend: antigravity`, `codex`, or `claude` in `config.yaml`.
 `search.iterations` is the **total** number of search proposals across all
@@ -60,10 +70,10 @@ RUN_DIR="$PWD/loop/experiments/$RUN"
 CLUSTER="$RUN_DIR/deployment/cluster.yaml"
 set -o pipefail
 
-python loop/loop.py prepare --run "$RUN"
-loop/.venv/bin/chia up "$CLUSTER" -y 2>&1 | tee -a "$RUN_DIR/cluster-up.log"
-python loop/loop.py doctor --run "$RUN"
-python -u loop/loop.py run --run "$RUN" 2>&1 | tee -a "$RUN_DIR/driver.log"
+./loop/container.sh "$RUN" prepare
+./loop/container.sh "$RUN" chia up "$CLUSTER" -y 2>&1 | tee -a "$RUN_DIR/cluster-up.log"
+./loop/container.sh "$RUN" doctor
+./loop/container.sh "$RUN" run 2>&1 | tee -a "$RUN_DIR/driver.log"
 ```
 
 `prepare` freezes current local implementation inputs, including relevant
@@ -72,10 +82,12 @@ pinned upstream worker images. Builds use the preserved source, not the image's
 bundled Chipyard checkout. `doctor` makes a real provider/BashTool checksum call;
 `run` also probes authentication when new LLM work is needed.
 
-Antigravity/Claude binaries come from their upstream images. Codex uses
-read-only host binary mounts on the CHIA base image. Provider logins are copied
-from read-only mounts into a private worker home. Refresh a host login and
-redeploy workers if the private copy has expired.
+Antigravity/Claude binaries come from their upstream images. Codex is installed
+with pinned npm inside its generation container, using the upstream Claude
+image's Node runtime. SCons is installed inside the build container. Provider logins are copied
+from read-only mounts into a private worker home. Existing login files can be
+reused. Refresh expired credential files through the provider's container CLI
+and redeploy workers to refresh their private copies.
 
 ## Stop and resume
 
@@ -84,7 +96,7 @@ search/evaluation and releases the run's writer lock. Then tear down that run's
 native workers and Ray head:
 
 ```sh
-loop/.venv/bin/chia down "$CLUSTER" -y
+./loop/container.sh "$RUN" chia down "$CLUSTER" -y
 ```
 
 Use the deployment YAML that actually started those workers. Keep it until
@@ -93,16 +105,21 @@ driver also leaves workers running until `chia down`. Teardown retains experimen
 files, SQL history, checkpoints, and the preserved seed. Other live runs should
 use their own deployment YAML and distinct names/ports.
 
-To continue the latest state later, source `env.sh`, set `RUN`, `RUN_DIR`, and
+To continue the latest state later, set `RUN`, `RUN_DIR`, and
 `CLUSTER` as above, then:
 
 ```sh
-python loop/loop.py prepare --run "$RUN"
-loop/.venv/bin/chia up "$CLUSTER" -y
-python -u loop/loop.py resume --run "$RUN" 2>&1 | tee -a "$RUN_DIR/driver.log"
+./loop/container.sh "$RUN" prepare
+./loop/container.sh "$RUN" chia up "$CLUSTER" -y
+./loop/container.sh "$RUN" resume 2>&1 | tee -a "$RUN_DIR/driver.log"
 ```
 
 If the cluster is still up with the same configuration, just run `resume`.
+For a driver started without an interactive terminal, send SIGINT from another
+terminal with `./loop/container.sh "$RUN" bash -c "pkill -INT -f 'loop.py (run|resume)'"`
+and wait for its exit before `chia down`. After teardown, optional
+`./loop/container.sh "$RUN" remove` removes the controller; state and its Docker
+package volume remain. Recreating that controller requires bootstrap again.
 There is no explicit save command or checkpoint YAML field: checkpoints commit
 automatically after seed initialization and controller callbacks. After an
 interruption, the latest native checkpoint and SQL completions recover pending
@@ -110,6 +127,10 @@ work. Completed SQL proposals do not invoke the generation LLM again; unfinished
 generations can. The optional authentication probe is a separate provider call.
 Build/simulation reuse depends on CHIA cache contents; evicted or unfinished
 tasks may run again.
+
+This container-only setup changes the frozen worker contract. Earlier
+host-toolchain experiments require their original matching code/settings;
+start a new run for this setup. Existing experiment files are retained.
 
 To switch providers: stop the driver, use `chia down` on its existing deployment,
 edit `agent.backend`, then `prepare`, `chia up`, and `resume`. Saved proposals
@@ -120,7 +141,7 @@ retain their original provider and sources.
 These commands are read-only and work while the driver runs:
 
 ```sh
-python loop/loop.py status --run "$RUN"   # latest checkpoint's recovery envelope
+./loop/container.sh "$RUN" status        # latest checkpoint's recovery envelope
 cat "$RUN_DIR/latest.json"               # checkpoint directory name
 ls "$RUN_DIR/checkpoints"                # increasing checkpoint sequence
 ```
@@ -130,7 +151,7 @@ SQL shows newer work that may not have reached a checkpoint yet. To list committ
 checkpoints and their admitted candidates without loading the search engine:
 
 ```sh
-python - "$RUN_DIR" <<'PY_CHECKPOINTS'
+./loop/container.sh "$RUN" python - "$RUN_DIR" <<'PY_CHECKPOINTS'
 import json, pathlib, sys
 run = pathlib.Path(sys.argv[1])
 latest = json.loads((run / "latest.json").read_text())["checkpoint"]
@@ -146,10 +167,10 @@ checkpoint containing an admitted candidate:
 
 ```sh
 CHECKPOINT=00000003-xxxxxxxx
-python loop/loop.py fork --run "$RUN" --checkpoint "$CHECKPOINT" --new-run branch-001
+./loop/container.sh "$RUN" fork --checkpoint "$CHECKPOINT" --new-run branch-001
 # Alternative: run this instead of the command above.
 CANDIDATE=candidate-xxxxxxxx
-python loop/loop.py fork --run "$RUN" --candidate "$CANDIDATE" --new-run branch-001
+./loop/container.sh "$RUN" fork --candidate "$CANDIDATE" --new-run branch-001
 ```
 
 Omit both selectors to fork the latest checkpoint. The destination must not
@@ -166,57 +187,57 @@ source cluster remains up, as described next.
 
 ## Restore in a fresh GitHub clone
 
-A GitHub clone supplies code, not experiment state. You need the matching loop
-implementation, the source experiment, and the preserved seed referenced by its
-`run.json`. The seed contains the fixed base Chipyard/generators, benchmark
-sources, parser, and relevant local changes. SQL contains each proposal's two
-complete Scala sources, lineage, and generation response.
+**Restore-only installation needs no Chipyard source setup or host toolchain.**
+Check out only `loop/`; the saved seed supplies generator/benchmark/parser inputs,
+and published CHIA images supply build/runtime tools. Docker, SSH/Docker access,
+and provider credentials are still needed.
 
-The following same-host workflow keeps the original running and shares only its
-immutable seed/toolchain. Start in the **source checkout**, whose loop code must
-match the run being restored:
+A GitHub clone supplies code, not experiment state. Keep the matching loop code,
+selected checkpoint, SQL, frozen ELFs, and the entire seed referenced by `run.json`.
+The following same-host example uses a new GitHub clone beneath the source
+checkout's mounted directory so its controller can write the destination:
 
 ```sh
 SOURCE="$PWD"
-DEST=/absolute/path/cy-chia-branch
-REPO_URL="$(git remote get-url origin)"
-CODE_REVISION="$(git rev-parse HEAD)"
-git clone "$REPO_URL" "$DEST"
-git -C "$DEST" checkout "$CODE_REVISION"
-```
-
-The repository is the tutorial's Chipyard fork containing `loop/` and the DMA
-integration; cloning vanilla upstream Chipyard alone does not supply them.
-The selected code commit must be available from GitHub. If the matching loop
-has uncommitted changes, also copy those files; a Git revision cannot restore
-them. For example, copy the current loop implementation without runtime state:
-
-```sh
-rsync -a --exclude .deps --exclude .venv --exclude experiments \
-  --exclude __pycache__ --exclude .pytest_cache "$SOURCE/loop/" "$DEST/loop/"
-```
-
-Restore the selected full checkpoint directly into the new clone. Use a
-**different run name** to avoid container/head directory collisions:
-
-```sh
+DEST="$SOURCE/loop/experiments/branch-checkout"
 RUN=run-001
+# Replace these with your tutorial repository URL and matching published commit.
+REPO_URL=https://github.com/YOUR-ORG/cy-chia-tutorial.git
+CODE_REVISION=YOUR_MATCHING_COMMIT
+./loop/container.sh "$RUN" bash -s -- "$REPO_URL" "$DEST" "$CODE_REVISION" <<'SH_CLONE'
+git clone --filter=blob:none --sparse "$1" "$2"
+git -C "$2" sparse-checkout set loop
+git -C "$2" checkout "$3"
+SH_CLONE
+```
+
+This creates an independent Git clone. No source submodules or Chipyard setup
+are needed in it. For a matching loop with uncommitted changes, copy them too
+using container tools; the seed excludes `loop/`:
+
+```sh
+./loop/container.sh "$RUN" bash -c 'rsync -a --exclude .deps --exclude .venv --exclude experiments --exclude __pycache__ --exclude .pytest_cache loop/ "$1/loop/"' bash "$DEST"
 CHECKPOINT=00000003-xxxxxxxx
-python "$SOURCE/loop/loop.py" fork --run "$RUN" --checkpoint "$CHECKPOINT" \
+./loop/container.sh "$RUN" fork --checkpoint "$CHECKPOINT" \
   --new-run "$DEST/loop/experiments/branch-001"
 # --candidate "$CANDIDATE" may replace --checkpoint "$CHECKPOINT".
-
-# Reuse this host's initialized toolchain; create a new loop-local venv.
-ln -s "$SOURCE/.conda-env" "$DEST/.conda-env"
-source "$SOURCE/env.sh"
 cd "$DEST"
-python loop/bootstrap.py
+RUN=branch-001
+./loop/container.sh "$RUN" bootstrap
 ```
 
-The restored run builds from its self-contained seed, so a second submodule or
-Chipyard toolchain initialization is unnecessary for this same-host restore.
-To create an unrelated new seed from the new checkout later, initialize that
-checkout with the normal Chipyard setup first.
+The destination must not already contain `branch-001`. Bootstrap can run in the
+new clone while the source driver continues. Its controller mounts the run's
+preserved seed read-only, even when that seed is outside the new checkout.
+Keep restored state in place **before starting its controller/prepare** so it
+reuses the seed instead of capturing the sparse checkout. A new experiment
+requires initialized source inputs; a restored experiment does not.
+
+For a destination outside the controller's project mount, fork locally first,
+then use a published CHIA container with source/destination bind mounts and
+`rsync -a` to transfer that stopped child directory to the other clone. Do not
+copy a live SQL main file directly. The seed can remain shared by absolute path
+on the same machine.
 
 In the **new clone's** `loop/config.yaml`, choose unused ports in all four places:
 
@@ -236,9 +257,9 @@ simultaneous clusters share the host's physical resources.
 RUN=branch-001
 RUN_DIR="$PWD/loop/experiments/$RUN"
 CLUSTER="$RUN_DIR/deployment/cluster.yaml"
-python loop/loop.py prepare --run "$RUN"
-loop/.venv/bin/chia up "$CLUSTER" -y
-python -u loop/loop.py resume --run "$RUN" 2>&1 | tee -a "$RUN_DIR/driver.log"
+./loop/container.sh "$RUN" prepare
+./loop/container.sh "$RUN" chia up "$CLUSTER" -y
+./loop/container.sh "$RUN" resume 2>&1 | tee -a "$RUN_DIR/driver.log"
 ```
 
 `prepare` regenerates absolute mounts for the new clone. Do not reuse the
@@ -249,7 +270,7 @@ search recovery, but keep the source experiment if you need its raw evidence.
 
 For a restore on another machine, transfer a completed fork directory and its
 **entire** seed directory (`manifest.json` and `tree/`, preserving symlinks/modes),
-install the matching toolchain/loop dependencies, and update only the copied
+bootstrap the matching container dependencies, and update only the copied
 run's `run.json` `seed` path to the transferred seed. Regenerate the deployment
 with `prepare`. There is no portable export/import or checkpoint migration
 command; [INTEGRATION.md](INTEGRATION.md#restore-contract-and-compatibility)
@@ -267,9 +288,9 @@ CANDIDATE=candidate-xxxxxxxx
 tail -n 80 "$RUN_DIR/artifacts/$CANDIDATE/build.log"
 tail -n 80 "$RUN_DIR/artifacts/$CANDIDATE/embench_dma_wikisort.log"
 tail -n 80 "$RUN_DIR/software-build-0.log"
-loop/.venv/bin/chia status --chia-cluster "$CLUSTER"
+./loop/container.sh "$RUN" chia status --chia-cluster "$CLUSTER"
 # Task durations/cache callback profiling; emits a consolidated CSV table.
-loop/.venv/bin/chia viz-profile "$RUN_DIR/artifacts/profile/ChiaProfileCollector.log" --format table
+./loop/container.sh "$RUN" chia viz-profile "$RUN_DIR/artifacts/profile/ChiaProfileCollector.log" --format table
 ```
 
 The configured Ray dashboard is at `http://127.0.0.1:8287` (branch example:
@@ -283,7 +304,7 @@ above. Generation response/transcript data lives in SQL, not a separate log file
 query lists all proposals, their stage, score, source hash, and parent/island:
 
 ```sh
-python - "$RUN_DIR" <<'PY_METRICS'
+./loop/container.sh "$RUN" python - "$RUN_DIR" <<'PY_METRICS'
 import pathlib, sqlite3, sys
 path = (pathlib.Path(sys.argv[1]) / "metrics.db").resolve()
 with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
@@ -309,7 +330,7 @@ per-benchmark cycles/speedups and the generation response for one proposal:
 
 ```sh
 CANDIDATE=candidate-xxxxxxxx
-python - "$RUN_DIR" "$CANDIDATE" <<'PY_CANDIDATE'
+./loop/container.sh "$RUN" python - "$RUN_DIR" "$CANDIDATE" <<'PY_CANDIDATE'
 import pathlib, sqlite3, sys
 path = (pathlib.Path(sys.argv[1]) / "metrics.db").resolve()
 with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
@@ -360,7 +381,7 @@ search state. It makes no generation call and does not change the population:
 
 ```sh
 # With this run's native cluster up, and no other writer for this same run:
-python loop/loop.py replay --run "$RUN" --candidate "$CANDIDATE"
+./loop/container.sh "$RUN" replay --candidate "$CANDIDATE"
 ```
 
 A replay has a new `replay-*` SQL row and fresh cache tags. If the original driver
@@ -371,9 +392,8 @@ parent/island context, while future stochastic choices can differ. Runs require
 the current matching checkpoint format; there are no old-format migrations.
 
 ```sh
-loop/.venv/bin/python -m pytest -c loop/pytest.ini loop/tests -q
-CHIA_LIVE_AGENTS=1 loop/.venv/bin/python -m pytest -c loop/pytest.ini \
-  loop/tests/test_native_cluster.py -q
+./loop/container.sh "$RUN" python -m pytest -c loop/pytest.ini loop/tests -q
+./loop/container.sh "$RUN" bash -c 'CHIA_LIVE_AGENTS=1 python -m pytest -c loop/pytest.ini loop/tests/test_native_cluster.py -q'
 ```
 
 See [INTEGRATION.md](INTEGRATION.md) for ownership, checkpoint contents, restore
@@ -387,7 +407,8 @@ requirements, and validation evidence. Start reading the implementation at
 | --- | --- |
 | `config.yaml` | CHIA cluster resources, container names/images, startup, and tutorial search controls. |
 | `backend.yaml` | Fixed implementation, deployment, and evaluation settings. |
-| `bootstrap.py` | Install pinned Python dependencies in the loop environment. |
+| `container.sh` | Launch the published controller container and execute tutorial/CHIA commands. |
+| `bootstrap.py` | Prepare pinned CHIA/evolve-flows sources and install Python packages inside the controller. |
 | `loop.py` | Application commands and experiment lifecycle. |
 | `chia_dma/config.py` | Merge settings, resolve paths/CPU count, and select frozen settings. |
 | `chia_dma/runtime.py` | Preserve inputs, render deployment, attach CHIA cache/profiler, and authenticate. |

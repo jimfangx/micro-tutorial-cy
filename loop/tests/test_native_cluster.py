@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import subprocess
+import sys
 import time
 import pytest
 import ray
@@ -17,7 +18,7 @@ from native_fixture import native_ssh
 def chia(cfg, action, path):
     """Tests invoke the upstream CLI, just as the documented procedure does."""
     result = subprocess.run(
-        [cfg["python"], "-m", "chia.cli.main", action, str(path), "-y"],
+        [sys.executable, "-m", "chia.cli.main", action, str(path), "-y"],
         capture_output=True,
         text=True,
     )

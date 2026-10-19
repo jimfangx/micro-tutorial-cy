@@ -1,6 +1,7 @@
 """Ephemeral localhost SSH for testing the real CHIA CLI; all files stay in loop/."""
 
 import os
+import pwd
 import socket
 import subprocess
 import time
@@ -30,13 +31,13 @@ AuthorizedKeysFile {folder/'client.pub'}
 StrictModes no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
-UsePAM yes
-AllowUsers {os.environ['USER']}
+UsePAM no
+AllowUsers {pwd.getpwuid(os.getuid()).pw_name}
 LogLevel ERROR
 """)
     log = (folder / "sshd.log").open("w")
     proc = subprocess.Popen(
-        ["sudo", "-n", "/usr/sbin/sshd", "-D", "-e", "-f", str(config)],
+        ["/usr/sbin/sshd", "-D", "-e", "-f", str(config)],
         stdout=log,
         stderr=log,
     )
@@ -50,6 +51,7 @@ LogLevel ERROR
             except OSError:
                 time.sleep(0.05)
         cfg = load()
+        cfg["cluster"]["docker"]["container_name"] = os.environ["CHIA_CONTROLLER"]
         with socket.socket() as ray_socket, socket.socket() as dashboard_socket:
             ray_socket.bind(("127.0.0.1", 0))
             dashboard_socket.bind(("127.0.0.1", 0))
@@ -64,14 +66,12 @@ LogLevel ERROR
                 for command in cfg["cluster"][key]
             ]
         cfg["cluster"]["auth"] = {
-            "ssh_user": os.environ["USER"],
+            "ssh_user": pwd.getpwuid(os.getuid()).pw_name,
             "ssh_private_key": str(folder / "client"),
             "ssh_proxy_command": f"nc 127.0.0.1 {port}",
         }
         yield cfg, folder
     finally:
-        subprocess.run(
-            ["sudo", "kill", "-TERM", str(proc.pid)], check=False, capture_output=True
-        )
+        proc.terminate()
         proc.wait(timeout=10)
         log.close()

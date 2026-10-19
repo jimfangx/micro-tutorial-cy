@@ -5,8 +5,6 @@ from pathlib import Path
 import argparse
 import asyncio
 import json
-import os
-import sys
 import uuid
 
 from chia_dma.config import ROOT, load
@@ -27,10 +25,6 @@ def main():
     parser.add_argument("--new-run", help="New run name or absolute experiment path")
     args = parser.parse_args()
     cfg = load(args.config)
-    if os.path.abspath(sys.executable) != cfg["python"]:
-        os.execv(
-            cfg["python"], [cfg["python"], str(Path(__file__).resolve()), *sys.argv[1:]]
-        )
     from chia_dma.runtime import prepare, Runtime, authenticate, prepare_software
     from chia_dma.state import State, fork
     from chia_dma.evaluation import DMAEvaluator

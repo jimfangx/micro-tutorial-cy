@@ -36,8 +36,6 @@ def load(path=ROOT / "config.yaml"):
     merge(cfg, dict(**settings, cluster=cluster))
     for key in ("source", "storage", "chia", "skydiscover", "evolve_flows"):
         cfg[key] = str((ROOT / cfg[key]).resolve())
-    cfg["python"] = os.path.abspath(ROOT / cfg["python"])
-    cfg["runtime"]["conda"] = str((ROOT / cfg["runtime"]["conda"]).resolve())
     for backend in cfg["agent"]["backends"].values():
         backend["credentials"] = str((ROOT / backend["credentials"]).resolve())
     generation = cfg["cluster"]["available_node_types"]["generation"]
