@@ -32,11 +32,10 @@ repository's `loop/` directory or the root of a copied tutorial folder.
 - [Choose a checkpoint](README.md#find-a-candidate-or-checkpoint): inspect committed
   `state.json` envelopes, then `fork --checkpoint NAME --new-run OTHER` or
   `fork --candidate ID --new-run OTHER`. No checkpoint selector lives in YAML.
-- [Restore in a fresh clone](README.md#restore-in-a-fresh-github-clone): obtain
-  matching loop code in a loop-only sparse checkout, fork into its experiment
-  directory, retain access to the preserved seed, bootstrap the host Python packages,
-  regenerate its deployment, then `chia up` and `resume`. Separate live clusters require distinct run names,
-  head/worker ports, dashboard ports, and matching `runtime.ray_address` values.
+- [Restore the tutorial archive](README.md#restore-the-tutorial-archive): extract
+  the supplied code/state/seed archive, bootstrap the host Python environment,
+  then `prepare`, `chia up`, and submit a `resume` job. Attendees use their own
+  provider credentials; no Git checkout, rsync, fork, or metadata edits are needed.
 - [Inspect logs and metrics](README.md#logs-and-consolidated-metrics): `chia job logs`,
   raw candidate logs, native CHIA profiling, and read-only consolidated SQL queries.
 
@@ -172,7 +171,7 @@ Paths below are relative to `experiments/NAME/` beside `loop.py`, except for the
 
 | Path | Contents and use |
 | --- | --- |
-| `run.json` | Absolute preserved-seed path, frozen settings hash, optional loop Git revision/dirty flag, and fork provenance. |
+| `run.json` | Preserved-seed path (bundled `experiments/seeds/HASH/` preferred), frozen settings hash, optional loop Git revision/dirty flag, and fork provenance. |
 | `metrics.db` | CHIA SQLite proposal/source archive and consolidated numerical history. Keep WAL/SHM companions while a writer is live. |
 | `latest.json` | Name of the latest committed checkpoint, used by resume. |
 | `checkpoints/SEQUENCE-SUFFIX/state.json` | Frozen settings hash, admitted candidate IDs, and generated/evaluated flags for SQL requests at that boundary. |
@@ -224,50 +223,21 @@ fixed source seed, frozen ELFs, and matching settings. Preserve the following:
 4. The matching loop implementation/configuration and pinned dependencies, plus
    the pinned published images, credentials, Docker, and SSH access.
 
-Neither starting nor restoring a run needs an initialized host Chipyard checkout.
-An existing run's preserved seed contains the generator, benchmark, parser, and build-source tree.
-The README's sparse clone checks out only `loop/`, then bootstraps the Python
-packages and prepares the restored run. It does not run Chipyard submodule
-initialization, `build-setup.sh`, or `env.sh`. The existing `run.json` must be
-present before `prepare` to restore that run; otherwise `prepare` starts a new
-experiment using the bundled patch and pinned image.
+The archive includes the loop implementation/configuration as well as saved
+state; attendees bootstrap `.venv` and pinned dependencies after extraction.
+No host Chipyard checkout, toolchain, or Git metadata is required.
 
-The new clone creates `.venv` beside `loop.py` with Python 3.10.19 and bootstraps the native head
-packages. Restored metadata must exist before `prepare`; worker mounts then use
-its referenced seed, including a seed outside the new checkout. No host Chipyard
-`env.sh`, Conda toolchain, JVM, compiler, or agent executable is needed. The
-source-only checkout must contain the matching loop implementation/configuration.
+`prepare` prefers the bundled seed under `experiments/seeds/HASH/` over the
+original absolute path in `run.json`, even if the original seed still exists.
+If no local seed is present, same-host forks can use the original shared seed.
+No metadata edits are needed after extracting the archive. Keep seed contents
+and frozen evaluation/search settings unchanged; `prepare` checks those settings
+and regenerates the deployment with local paths. It does not audit the seed's
+contents against its manifest.
 
-`fork` copies the selected native checkpoint and an online SQL backup, retains
-frozen software files, and updates the child run's metadata/latest pointer. It
-excludes old `artifacts/`, `cache/`, `deployment/`, `work/`, and writer locks. The
-source's raw logs remain there. The child can rebuild expensive outputs without
-another generation call for retained completed proposals. It shares the source
-seed by its absolute path; copying that seed is unnecessary on the same filesystem.
-The child does not need to retain the source experiment once its state is copied,
-but it must retain access to the seed.
-
-On another machine/filesystem, transfer the completed child directory and its
-seed while the child is stopped. Use `rsync -a` to preserve links/modes. Update
-**only the copied run** to the new absolute seed path, using the host environment:
-
-```sh
-python - "$NEW_RUN_DIR" "$NEW_SEED" <<'PY_RELOCATE'
-import json, pathlib, sys
-path = pathlib.Path(sys.argv[1]) / 'run.json'
-meta = json.loads(path.read_text())
-meta["seed"] = sys.argv[2]
-path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
-PY_RELOCATE
-```
-
-Keep the seed contents unchanged and use matching loop/evaluation settings;
-`prepare` is a frozen-settings check and deployment renderer, not an importer or
-an automatic seed manifest audit. Bootstrap the host Python dependencies,
-configure local SSH/provider paths, then follow the README's `prepare`, `chia up`,
-and `resume` procedure. Regenerate rendered YAML and absolute deployment paths.
-The previous container-head worker contract requires its matching loop code;
-there is no migration to this host-head setup. Its experiment files remain intact.
+Historical forks remain optional: `fork` copies the selected native checkpoint,
+filtered SQL, and frozen ELFs, retaining a reference to the source seed. Raw
+logs, task caches, deployments, and workspaces remain in the source run.
 
 Compatibility is deliberately limited:
 
@@ -276,7 +246,6 @@ Compatibility is deliberately limited:
   `run.json` records a Git revision and dirty flag when available, not an archive
   of loop code. A copied loop needs no repository or commits: revision is null
   without a commit, and the dirty flag is null outside a repository.
-  The seed excludes `loop/`; preserve uncommitted loop changes separately.
 - `prepare` rejects a changed frozen configuration. Fixed baseline patch/script, hardware/software,
   fitness, native search policy, dependency pins, and build/simulation worker
   image/mount/environment/setup contracts are part of that hash. It is not a
@@ -286,9 +255,8 @@ Compatibility is deliberately limited:
   workers with native `chia down/up`. Generation workspace serialization remains
   enforced.
 - Automatic host CPU count is included as `hardware.make_jobs` in frozen settings.
-  A host with a different CPU-affinity count therefore fails the current restore
-  check. This is not an automatic cross-machine portability workflow; the
-  tutorial's normal policy remains all available cores and a fixed 32 GiB heap.
+  Tutorial machines must use matching CPU-affinity counts; a different count
+  fails the restore check. Builds use all available cores and a fixed 32 GiB heap.
 - Native checkpoints restore full populations, islands, valid archives, feature
   maps/statistics, best/iteration metadata, and migration counters. They do not
   save RNG state. Pending selections preserve their original parent/island and

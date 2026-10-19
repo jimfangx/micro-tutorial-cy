@@ -39,14 +39,13 @@ Generation, compilation, and simulation run in Docker workers. Run commands on
 the host, from the directory containing **`loop.py` and `config.yaml`**, with
 `.venv` activated. In this repository, first `cd loop`; for a copied folder such
 as `/scratch/jfx/chia-tutorial-run`, first `cd /scratch/jfx/chia-tutorial-run`.
-A copied `loop/` folder or a sparse clone supports both new runs and checkpoint
-restores. The copied folder needs no Git repository or commits. Replace
-example run, candidate, checkpoint, and destination names with your own.
+The distributed loop folder supports both new runs and checkpoint restores.
+Replace example run, candidate, checkpoint, and destination names with your own.
 
 ## Set up and run
 
 This section creates a new experiment without a host Chipyard checkout. For an
-existing checkpoint, see [restore in a fresh clone](#restore-in-a-fresh-github-clone).
+existing checkpoint, see [restore the tutorial archive](#restore-the-tutorial-archive).
 
 Use a Linux x86-64 host. The Ubuntu commands below install host utilities and
 start SSH; install [Docker Engine](https://docs.docker.com/engine/install/ubuntu/)
@@ -269,81 +268,51 @@ candidate, and subsequent parents are selected by native SkyDiscover sampling.
 
 Forking works while the source driver is running: it reads immutable checkpoints
 and takes an online SQLite backup, then removes history later than the selected
-snapshot. The source run continues independently. To run the child here, use its
-run name in `prepare`, `chia up`, and `resume`; use separate Ray ports if the
-source cluster remains up, as described next.
+snapshot. The source run continues independently.
 
-## Restore in a fresh GitHub clone
+`fork` creates the restored branch on disk; it does not start a cluster or
+resume the search. A repeated fork to the same destination raises
+`FileExistsError`; continue with the existing branch. Use its run name with the
+`prepare`, `chia up`, and `resume` commands below. Attendees using the supplied
+archive can skip checkpoint selection and forking entirely.
 
-**New runs and restores need no host Chipyard source setup or toolchain.**
-Check out only `loop/`; the saved seed supplies generator/benchmark/parser inputs,
-and published CHIA images supply build/runtime tools. The host still needs the
-Python head environment, Docker, SSH/Docker access, and provider credentials.
-Complete the host setup above first when restoring on a new machine.
+## Restore the tutorial archive
 
-A GitHub clone supplies code, not experiment state. Keep the matching loop code,
-selected checkpoint, SQL, frozen ELFs, and the entire seed referenced by `run.json`.
-The following same-host example creates a separate GitHub clone:
+The archive contains the matching loop code, a stopped experiment, and its
+complete seed. Tutorial machines use matching specs and CPU-affinity counts.
+
+After [stopping the loop](#stop-and-resume), the instructor creates the archive
+from the directory containing `loop.py`. Set `RUN` to the experiment to share:
 
 ```sh
-SOURCE="$PWD"
-DEST="$(dirname "$SOURCE")/branch-checkout"
 RUN=run-001
-# Replace these with your tutorial repository URL and matching published commit.
-REPO_URL=https://github.com/YOUR-ORG/cy-chia-tutorial.git
-CODE_REVISION=YOUR_MATCHING_COMMIT
-git clone --filter=blob:none --sparse "$REPO_URL" "$DEST"
-git -C "$DEST" sparse-checkout set loop
-git -C "$DEST" checkout "$CODE_REVISION"
+tar -czf ../loop-tutorial.tar.gz \
+  --exclude=__pycache__ --exclude=.writer.lock \
+  --exclude="experiments/$RUN/cache" --exclude="experiments/$RUN/artifacts" \
+  --exclude="experiments/$RUN/deployment" --exclude="experiments/$RUN/work" \
+  *.py *.yaml chia_dma base tests README.md INTEGRATION.md pytest.ini \
+  "experiments/$RUN" experiments/seeds
 ```
 
-This creates an independent Git clone. No source submodules or Chipyard setup
-are needed in it. For a matching loop with uncommitted changes, copy them too
-using `rsync`; the seed excludes `loop/`:
+This includes saved population/SQL state and frozen ELFs, preserves seed links
+and permissions, and leaves installed environments and generated work out.
+
+Attendees complete the Docker, SSH, provider login, and `uv` host setup under
+[Set up and run](#set-up-and-run), then extract into a new folder and resume:
 
 ```sh
-rsync -a --exclude .git --exclude .deps --exclude .venv --exclude experiments \
-  --exclude __pycache__ --exclude .pytest_cache ./ "$DEST/loop/"
-CHECKPOINT=00000003-xxxxxxxx
-python loop.py fork --run "$RUN" --checkpoint "$CHECKPOINT" \
-  --new-run "$DEST/loop/experiments/branch-001"
-# --candidate "$CANDIDATE" may replace --checkpoint "$CHECKPOINT".
-cd "$DEST/loop"
-RUN=branch-001
+mkdir loop
+tar -xzf loop-tutorial.tar.gz -C loop
+cd loop
 uv venv --python 3.10.19 --managed-python --seed .venv
 source .venv/bin/activate
 python -m pip install pyyaml==6.0.3
 python bootstrap.py
-```
 
-The destination must not already contain `branch-001`. Bootstrap can run in the
-new clone while the source driver continues. Workers mount the run's preserved
-seed read-only, even when that seed is outside the new checkout.
-Keep restored state in place **before prepare** so it
-reuses the recorded seed. Without restored metadata, `prepare` starts a new
-experiment from the bundled patch and pinned build image.
-
-Do not copy a live SQL main file directly; `fork` takes an online backup. The seed
-can remain shared by absolute path on the same machine.
-
-In the **new clone's** `loop/config.yaml`, choose unused ports in all four places:
-
-| Setting | Source example | Branch example |
-| --- | --- | --- |
-| Head Ray `--port` | `6387` | `6388` |
-| Worker Ray `--address=$RAY_HEAD_IP:PORT` | `6387` | `6388` |
-| `runtime.ray_address` | `127.0.0.1:6387` | `127.0.0.1:6388` |
-| Head `--dashboard-port` | `8287` | `8288` |
-
-Increase `search.iterations` beyond the retained search proposal count if you
-want additional proposals. Keep fixed evaluation/search rules and image pins
-unchanged. Each build still uses all available CPUs and 32 GiB of heap; two
-simultaneous clusters share the host's physical resources.
-
-```sh
-RUN=branch-001
+RUN=run-001  # Use the run name packaged by the instructor.
 RUN_DIR="$PWD/experiments/$RUN"
 CLUSTER="$RUN_DIR/deployment/cluster.yaml"
+python loop.py status --run "$RUN"
 python loop.py prepare --run "$RUN"
 chia up "$CLUSTER" -y
 JOB="$RUN-$(date +%s)"
@@ -352,19 +321,18 @@ chia job submit --chia-cluster "$CLUSTER" --submission-id "$JOB" --no-wait -- \
 chia job logs --chia-cluster "$CLUSTER" "$JOB" --follow
 ```
 
-`prepare` regenerates absolute mounts for the new clone. Do not reuse the
-source's rendered cluster YAML. Fork copies frozen benchmark ELFs and the
-selected native checkpoint plus filtered SQL; expensive cache entries, raw logs,
-and transient workspaces stay in the source experiment. They are not needed for
-search recovery, but keep the source experiment if you need its raw evidence.
+`status` shows the saved checkpoint's admitted candidates and pending-work flags.
+`prepare` finds the bundled seed under `experiments/seeds/HASH/` and regenerates
+paths for the extracted folder. `chia up` must finish before submitting the
+resume job, which loads the saved population and recovers unfinished SQL work.
+Completed proposals are retained; unfinished evaluations may run again.
 
-For a restore on another machine, transfer a completed fork directory and its
-**entire** seed directory (`manifest.json` and `tree/`, preserving symlinks/modes),
-bootstrap the matching host Python dependencies, and update only the copied
-run's `run.json` `seed` path to the transferred seed. Regenerate the deployment
-with `prepare`. There is no portable export/import or checkpoint migration
-command; [INTEGRATION.md](INTEGRATION.md#restore-contract-and-compatibility)
-details the required files and compatibility limits, including CPU-count changes.
+The same run name and default ports work on each attendee's separate machine.
+If switching runs on one machine, tear down the previous cluster with its
+original deployment YAML first. Only simultaneous clusters on the same machine
+need separate Ray/dashboard ports and matching head/worker connection settings.
+See [INTEGRATION.md](INTEGRATION.md#restore-contract-and-compatibility) for the
+saved-state contract.
 
 ## Logs and consolidated metrics
 
@@ -520,7 +488,7 @@ requirements, and validation evidence.
 | `tests/test_controller_integration.py` | Controller concurrency, cache/profiler, and recovery integration. |
 | `tests/test_native_cluster.py` | Real native worker placement, mount boundaries, staging, and optional provider checks. |
 | `tests/native_fixture.py` | Temporary localhost SSH fixture for native cluster tests. |
-| `tests/test_preservation.py` | Immutable image-plus-patch seed reuse and candidate restoration. |
+| `tests/test_preservation.py` | Immutable seed reuse, candidate restoration, and archive relocation. |
 | `tests/conftest.py` | Load test source inputs from the bundled patch. |
 | `tests/fixtures/rtl-measurements.json` | Recorded Embench inputs for aggregation tests. |
 | `tests/fixtures/embench-observation.txt` | Recorded hardware plus synthetic software counters for parser integration. |

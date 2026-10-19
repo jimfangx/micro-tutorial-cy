@@ -1,4 +1,4 @@
-"""Prepare inputs, render native deployment, then attach CHIA services."""
+"""Prepare CHIA deployment, cache, and profiling."""
 
 from pathlib import Path
 from string import Template
@@ -27,17 +27,17 @@ def prepare(configuration, run):
         if meta["frozen_hash"] != digest(frozen(configuration)):
             raise ValueError("Frozen evaluation/search configuration changed")
     else:
-        working_tree_status = git(ROOT, "status", "--porcelain", "--", ".")
+        status = git(ROOT, "status", "--porcelain", "--", ".")
         meta = {
             "run_id": run.name,
             "seed": str(preserve_source(configuration)),
             "frozen_hash": digest(frozen(configuration)),
             "loop_revision": git(ROOT, "rev-parse", "HEAD"),
-            "loop_dirty": (
-                None if working_tree_status is None else bool(working_tree_status)
-            ),
+            "loop_dirty": None if status is None else bool(status),
         }
         write_json(run / "run.json", meta)
+    seed = run.parent / "seeds" / Path(meta["seed"]).name
+    meta["seed"] = str(seed if seed.is_dir() else meta["seed"])
     render(configuration, run, meta["seed"])
     return meta
 
@@ -53,7 +53,7 @@ def expand(value, bindings):
 
 
 def render(configuration, run, seed):
-    """Only expand run paths and separate native generation-worker file binds."""
+    """Expand run paths and generation mounts."""
     agent = configuration["agent"]
     backend = agent["backends"][agent["backend"]]
     bindings = dict(

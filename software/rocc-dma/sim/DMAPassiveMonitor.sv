@@ -29,7 +29,7 @@ module DMAPassiveMonitor #(parameter SOURCE_BITS=1) (
   bit active[SOURCES], is_write[SOURCES];
   logic [3:0] sizes[SOURCES];
   bit pending=0, copy_pending=0, response_seen=0, was_busy=0;
-  bit trace_events;
+  bit trace_events, command_was_pending;
   longint unsigned latency;
   initial trace_events=$test$plusargs("dma-trace");
 
@@ -37,6 +37,21 @@ module DMAPassiveMonitor #(parameter SOURCE_BITS=1) (
     protocol_errors++;
     $fdisplay(32'h80000002,"DMA_PROTOCOL_FAIL metrics_version=1 cycle=%0d reason=%s",cycle,message);
     $fatal(1,"DMA passive protocol check failed");
+  endtask
+
+  task automatic accept_command;
+    if (pending) violation("overlapping_RoCC_commands");
+    pending=xd;
+    if (funct==0) begin
+      configs++; config_cycle=cycle;
+      if (xd && xs1 && xs2) begin source_address=rs1; destination_address=rs2; end
+      if (trace_events) $fdisplay(32'h80000002,"DMA_CONFIG metrics_version=1 accept_cycle=%0d src=%0d dst=%0d",cycle,rs1,rs2);
+    end
+    if (funct==1 && xd) begin
+      copies++; copy_pending=1; response_seen=0; copy_cycle=cycle; length=rs1;
+      before_reads=reads; before_writes=writes;
+      before_read_bytes=read_bytes; before_write_bytes=write_bytes;
+    end
   endtask
 
   always @(posedge clock) begin
@@ -52,6 +67,7 @@ module DMAPassiveMonitor #(parameter SOURCE_BITS=1) (
       pending=0; copy_pending=0; response_seen=0;
       foreach (active[i]) active[i]=0;
     end else begin
+      command_was_pending=pending;
       cycle++;
       if (busy) busy_cycles++; else idle_cycles++;
       if (busy != was_busy) busy_transitions++;
@@ -61,6 +77,9 @@ module DMAPassiveMonitor #(parameter SOURCE_BITS=1) (
       if (d_valid && !d_ready) d_stall++;
       if (cmd_valid && !cmd_ready) cmd_stall++;
       if (resp_valid && !resp_ready) resp_stall++;
+
+      // With no older command, same-edge traffic and responses belong to this command.
+      if (cmd_valid && cmd_ready && !command_was_pending) accept_command();
 
       // Count accepted A requests, keyed by TileLink source, before D handling
       // so a legal zero-latency response can be measured as well.
@@ -115,20 +134,8 @@ module DMAPassiveMonitor #(parameter SOURCE_BITS=1) (
         end
         pending=0; copy_pending=0;
       end
-      if (cmd_valid && cmd_ready) begin
-        if (pending) violation("overlapping_RoCC_commands");
-        pending=xd;
-        if (funct==0) begin
-          configs++; config_cycle=cycle;
-          if (xd && xs1 && xs2) begin source_address=rs1; destination_address=rs2; end
-          if (trace_events) $fdisplay(32'h80000002,"DMA_CONFIG metrics_version=1 accept_cycle=%0d src=%0d dst=%0d",cycle,rs1,rs2);
-        end
-        if (funct==1 && xd) begin
-          copies++; copy_pending=1; response_seen=0; copy_cycle=cycle; length=rs1;
-          before_reads=reads; before_writes=writes;
-          before_read_bytes=read_bytes; before_write_bytes=write_bytes;
-        end
-      end
+      // Retire the previous response before recording its successor's metadata.
+      if (cmd_valid && cmd_ready && command_was_pending) accept_command();
     end
   end
   final begin

@@ -603,10 +603,10 @@ index 0000000..959246b
 +        raise ValueError(message)
 diff --git a/software/rocc-dma/sim/DMAPassiveMonitor.sv b/software/rocc-dma/sim/DMAPassiveMonitor.sv
 new file mode 100644
-index 0000000..4f2cee7
+index 00000000..5ef855ba
 --- /dev/null
 +++ b/software/rocc-dma/sim/DMAPassiveMonitor.sv
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,149 @@
 +// Fixed, simulation-only observer. Inputs only: no ready/valid or datapath drivers.
 +// The existing TileLink monitors retain full protocol/mask/stability assertions.
 +module DMAPassiveMonitor #(parameter SOURCE_BITS=1) (
@@ -638,7 +638,7 @@ index 0000000..4f2cee7
 +  bit active[SOURCES], is_write[SOURCES];
 +  logic [3:0] sizes[SOURCES];
 +  bit pending=0, copy_pending=0, response_seen=0, was_busy=0;
-+  bit trace_events;
++  bit trace_events, command_was_pending;
 +  longint unsigned latency;
 +  initial trace_events=$test$plusargs("dma-trace");
 +
@@ -646,6 +646,21 @@ index 0000000..4f2cee7
 +    protocol_errors++;
 +    $fdisplay(32'h80000002,"DMA_PROTOCOL_FAIL metrics_version=1 cycle=%0d reason=%s",cycle,message);
 +    $fatal(1,"DMA passive protocol check failed");
++  endtask
++
++  task automatic accept_command;
++    if (pending) violation("overlapping_RoCC_commands");
++    pending=xd;
++    if (funct==0) begin
++      configs++; config_cycle=cycle;
++      if (xd && xs1 && xs2) begin source_address=rs1; destination_address=rs2; end
++      if (trace_events) $fdisplay(32'h80000002,"DMA_CONFIG metrics_version=1 accept_cycle=%0d src=%0d dst=%0d",cycle,rs1,rs2);
++    end
++    if (funct==1 && xd) begin
++      copies++; copy_pending=1; response_seen=0; copy_cycle=cycle; length=rs1;
++      before_reads=reads; before_writes=writes;
++      before_read_bytes=read_bytes; before_write_bytes=write_bytes;
++    end
 +  endtask
 +
 +  always @(posedge clock) begin
@@ -661,6 +676,7 @@ index 0000000..4f2cee7
 +      pending=0; copy_pending=0; response_seen=0;
 +      foreach (active[i]) active[i]=0;
 +    end else begin
++      command_was_pending=pending;
 +      cycle++;
 +      if (busy) busy_cycles++; else idle_cycles++;
 +      if (busy != was_busy) busy_transitions++;
@@ -670,6 +686,9 @@ index 0000000..4f2cee7
 +      if (d_valid && !d_ready) d_stall++;
 +      if (cmd_valid && !cmd_ready) cmd_stall++;
 +      if (resp_valid && !resp_ready) resp_stall++;
++
++      // With no older command, same-edge traffic and responses belong to this command.
++      if (cmd_valid && cmd_ready && !command_was_pending) accept_command();
 +
 +      // Count accepted A requests, keyed by TileLink source, before D handling
 +      // so a legal zero-latency response can be measured as well.
@@ -724,20 +743,8 @@ index 0000000..4f2cee7
 +        end
 +        pending=0; copy_pending=0;
 +      end
-+      if (cmd_valid && cmd_ready) begin
-+        if (pending) violation("overlapping_RoCC_commands");
-+        pending=xd;
-+        if (funct==0) begin
-+          configs++; config_cycle=cycle;
-+          if (xd && xs1 && xs2) begin source_address=rs1; destination_address=rs2; end
-+          if (trace_events) $fdisplay(32'h80000002,"DMA_CONFIG metrics_version=1 accept_cycle=%0d src=%0d dst=%0d",cycle,rs1,rs2);
-+        end
-+        if (funct==1 && xd) begin
-+          copies++; copy_pending=1; response_seen=0; copy_cycle=cycle; length=rs1;
-+          before_reads=reads; before_writes=writes;
-+          before_read_bytes=read_bytes; before_write_bytes=write_bytes;
-+        end
-+      end
++      // Retire the previous response before recording its successor's metadata.
++      if (cmd_valid && cmd_ready && command_was_pending) accept_command();
 +    end
 +  end
 +  final begin

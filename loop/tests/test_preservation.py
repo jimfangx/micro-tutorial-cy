@@ -54,8 +54,9 @@ def test_image_seed_is_immutable_reusable_and_restores_candidates(
 
 
 @pytest.mark.parametrize("repository", ["none", "unborn", "committed"])
-def test_copied_loop_prepares_without_requiring_a_commit(
-    tmp_path, base_tree, monkeypatch, repository
+@pytest.mark.parametrize("bundled", [False, True])
+def test_copied_loop_prepares_and_relocates_without_requiring_a_commit(
+    tmp_path, base_tree, monkeypatch, repository, bundled
 ):
     from chia_dma import config, runtime
 
@@ -89,7 +90,7 @@ def test_copied_loop_prepares_without_requiring_a_commit(
             ],
             check=True,
         )
-    seed = tmp_path / "seed"
+    seed = copied / "experiments/seeds/frozen-seed" if bundled else tmp_path / "seed"
     shutil.copytree(base_tree, seed / "tree")
     monkeypatch.setattr(config, "ROOT", copied)
     monkeypatch.setattr(runtime, "ROOT", copied)
@@ -104,3 +105,17 @@ def test_copied_loop_prepares_without_requiring_a_commit(
     assert runtime.prepare(configuration, run) == meta
     deployment = yaml.safe_load((run / "deployment/cluster.yaml").read_text())
     assert deployment["head_env_commands"][0] == f"source {copied}/.venv/bin/activate"
+
+    relocated = tmp_path / "relocated-loop"
+    shutil.copytree(copied, relocated, symlinks=True)
+    monkeypatch.setattr(config, "ROOT", relocated)
+    monkeypatch.setattr(runtime, "ROOT", relocated)
+    configuration = config.load(relocated / "config.yaml")
+    run = relocated / "experiments/test"
+    restored = runtime.prepare(configuration, run)
+    expected = relocated / "experiments/seeds/frozen-seed" if bundled else seed
+    assert restored["seed"] == str(expected)
+    assert read_json(run / "run.json") == meta
+    assert str(copied) not in (run / "deployment/cluster.yaml").read_text()
+    shutil.rmtree(copied)
+    assert runtime.prepare(configuration, run) == restored
