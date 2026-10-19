@@ -18,6 +18,9 @@ The tutorial pins CHIA `a4cedf24`, evolve-flows `62d27130`, and SkyDiscover
 
 [README.md](README.md) contains the runnable procedures:
 
+Commands run from the directory containing `loop.py` and `config.yaml`: the
+repository's `loop/` directory or the root of a copied tutorial folder.
+
 - [Setup and run](README.md#set-up-and-run): bootstrap the host Python environment,
   `prepare` the bundled baseline inside the build image, native `chia up`,
   then `chia job submit` with the tutorial entrypoint. Routine commands run on the host.
@@ -53,7 +56,7 @@ files. This configuration is single-host; bind paths are local to its Docker dae
 
 | Location | Tools and integration |
 | --- | --- |
-| Host head | `loop/.venv`: Python 3.10.19/Ray 2.54.0, pinned CHIA, and SkyDiscover from the evolve-flows submodule. Bootstrap installs the selected OpenEvolve dependencies, omitting the unused AlphaEvolve backend. |
+| Host head | `.venv` beside `loop.py`: Python 3.10.19/Ray 2.54.0, pinned CHIA, and SkyDiscover from the evolve-flows submodule. Bootstrap installs the selected OpenEvolve dependencies, omitting the unused AlphaEvolve backend. |
 | Build: CHIA chisel-build | Image Java/sbt/Verilator/RISC-V/C++ tools and dependency caches; setup installs pinned SCons inside the container. Ray uses the image's base Python 3.10.19 to match the head exactly. |
 | Simulation: CHIA verilator-run | Image Python/Ray, spike-dasm, and runtime support; simulator/shared libraries arrive in the build artifact. |
 | Generation: CHIA Antigravity or Claude Code | Published provider executable; Codex uses the Claude image's Node/npm to install its pinned CLI in private scratch. |
@@ -165,7 +168,7 @@ Separate live native clusters need distinct head/dashboard ports and a matching
 
 ## Experiment files and queries
 
-Paths below are relative to `loop/experiments/NAME/`, except for the shared seed.
+Paths below are relative to `experiments/NAME/` beside `loop.py`, except for the shared seed.
 
 | Path | Contents and use |
 | --- | --- |
@@ -229,7 +232,7 @@ initialization, `build-setup.sh`, or `env.sh`. The existing `run.json` must be
 present before `prepare` to restore that run; otherwise `prepare` starts a new
 experiment using the bundled patch and pinned image.
 
-The new clone creates `loop/.venv` with Python 3.10.19 and bootstraps the native head
+The new clone creates `.venv` beside `loop.py` with Python 3.10.19 and bootstraps the native head
 packages. Restored metadata must exist before `prepare`; worker mounts then use
 its referenced seed, including a seed outside the new checkout. No host Chipyard
 `env.sh`, Conda toolchain, JVM, compiler, or agent executable is needed. The

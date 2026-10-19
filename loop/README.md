@@ -36,7 +36,9 @@ full historical search state, including the population and islands.
 
 The current machine runs the Ray head, search controller, SQLite, and cache.
 Generation, compilation, and simulation run in Docker workers. Run commands on
-the host, from the directory containing `loop/`, with `loop/.venv` activated.
+the host, from the directory containing **`loop.py` and `config.yaml`**, with
+`.venv` activated. In this repository, first `cd loop`; for a copied folder such
+as `/scratch/jfx/chia-tutorial-run`, first `cd /scratch/jfx/chia-tutorial-run`.
 A copied `loop/` folder or a sparse clone supports both new runs and checkpoint
 restores. The copied folder needs no Git repository or commits. Replace
 example run, candidate, checkpoint, and destination names with your own.
@@ -65,7 +67,8 @@ if needed:
 sudo usermod -aG docker "$USER"
 ```
 
-Log out and back in after changing groups, then continue below. The example is
+Log out and back in after changing groups, or run `newgrp docker` to open a shell
+with Docker access, then reactivate `.venv` in that shell. The example is
 single-host; all source/state bind paths must be available to that Docker daemon.
 
 Native CHIA connects to this machine through SSH. If you have not configured
@@ -86,8 +89,8 @@ passphrase, load it into your SSH agent before `chia up`. Authenticate your
 selected LLM provider using its container CLI and retain its login files at the
 credential paths in `backend.yaml`.
 
-From the directory containing the copied `loop/`, create the host head's Python
-environment once. Keep `loop/base/` and both YAML files. Start without copied
+From the directory containing `loop.py`, create the host head's Python
+environment once. Keep `base/` and both YAML files. Start without copied
 `.venv/` or `.deps/` directories: their installed paths belong to the old location.
 Git is needed to download dependencies, but your loop itself needs no Git metadata.
 
@@ -101,10 +104,10 @@ or head container is created:
 ```sh
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
-uv venv --python 3.10.19 --managed-python --seed loop/.venv
-source loop/.venv/bin/activate
+uv venv --python 3.10.19 --managed-python --seed .venv
+source .venv/bin/activate
 python -m pip install pyyaml==6.0.3
-python loop/bootstrap.py
+python bootstrap.py
 ```
 
 The commands below run **on the host**, with that environment activated. Native
@@ -119,14 +122,16 @@ the DMA hardware, observer, software/parser, and required Embench sources. See
 No Chipyard submodule initialization or `build-setup.sh` is needed.
 
 The host head uses Python 3.10.19 and Ray 2.54.0, matching the workers exactly;
-Ray rejects even a Python patch-version mismatch. Native YAML activates `loop/.venv` and
+Ray rejects even a Python patch-version mismatch. Native YAML activates the
+`.venv` beside `loop.py` and
 supplies worker import paths. Build tools come from the build image's own
 Chipyard environment; the host environment is never mounted into workers.
 
 Choose `agent.backend: antigravity`, `codex`, or `claude` in `config.yaml`.
 `search.iterations` is the **total** number of search proposals across all
-resumes, excluding the seed and replay evaluations. To extend a run, increase
-that total. `search.max_in_flight` bounds concurrent candidate iterations;
+resumes (20 means 20 proposals total), excluding the seed and replay evaluations.
+To extend a run, increase that total. `search.max_in_flight` bounds concurrent
+candidate iterations (2 means up to 2 candidates progressing at once);
 generation `num_workers` sets the number of isolated generation workspaces.
 Build and simulation pools have independent limits. Compilation uses all CPUs
 available to the host process, simulations fan out one task per available CPU,
@@ -134,15 +139,15 @@ and the JVM heap is fixed at 32 GiB.
 
 ```sh
 RUN=run-001
-RUN_DIR="$PWD/loop/experiments/$RUN"
+RUN_DIR="$PWD/experiments/$RUN"
 CLUSTER="$RUN_DIR/deployment/cluster.yaml"
 JOB="$RUN-$(date +%s)"
 set -o pipefail
 
-python loop/loop.py prepare --run "$RUN"
+python loop.py prepare --run "$RUN"
 chia up "$CLUSTER" -y 2>&1 | tee -a "$RUN_DIR/cluster-up.log"
 chia job submit --chia-cluster "$CLUSTER" --submission-id "$JOB" --no-wait -- \
-  python -u "$PWD/loop/loop.py" run --run "$RUN"
+  python -u "$PWD/loop.py" run --run "$RUN"
 chia job logs --chia-cluster "$CLUSTER" "$JOB" --follow
 ```
 
@@ -186,16 +191,16 @@ driver also leaves workers running until `chia down`. Teardown retains experimen
 files, SQL history, checkpoints, and the preserved seed. Other live runs should
 use their own deployment YAML and distinct names/ports.
 
-To continue the latest state later, activate `loop/.venv` on the host and set
+To continue the latest state later, activate `.venv` on the host and set
 `RUN`, `RUN_DIR`, and `CLUSTER` as above. Each submission needs a new
 job ID; the experiment run name stays the same:
 
 ```sh
-python loop/loop.py prepare --run "$RUN"
+python loop.py prepare --run "$RUN"
 chia up "$CLUSTER" -y
 JOB="$RUN-$(date +%s)"
 chia job submit --chia-cluster "$CLUSTER" --submission-id "$JOB" --no-wait -- \
-  python -u "$PWD/loop/loop.py" resume --run "$RUN"
+  python -u "$PWD/loop.py" resume --run "$RUN"
 chia job logs --chia-cluster "$CLUSTER" "$JOB" --follow
 ```
 
@@ -224,7 +229,7 @@ retain their original provider and sources.
 These commands are read-only and work while the driver runs:
 
 ```sh
-python loop/loop.py status --run "$RUN"        # latest checkpoint's recovery envelope
+python loop.py status --run "$RUN"        # latest checkpoint's recovery envelope
 cat "$RUN_DIR/latest.json"               # checkpoint directory name
 ls "$RUN_DIR/checkpoints"                # increasing checkpoint sequence
 ```
@@ -250,10 +255,10 @@ checkpoint containing an admitted candidate:
 
 ```sh
 CHECKPOINT=00000003-xxxxxxxx
-python loop/loop.py fork --run "$RUN" --checkpoint "$CHECKPOINT" --new-run branch-001
+python loop.py fork --run "$RUN" --checkpoint "$CHECKPOINT" --new-run branch-001
 # Alternative: run this instead of the command above.
 CANDIDATE=candidate-xxxxxxxx
-python loop/loop.py fork --run "$RUN" --candidate "$CANDIDATE" --new-run branch-001
+python loop.py fork --run "$RUN" --candidate "$CANDIDATE" --new-run branch-001
 ```
 
 Omit both selectors to fork the latest checkpoint. The destination must not
@@ -297,18 +302,18 @@ are needed in it. For a matching loop with uncommitted changes, copy them too
 using `rsync`; the seed excludes `loop/`:
 
 ```sh
-rsync -a --exclude .deps --exclude .venv --exclude experiments \
-  --exclude __pycache__ --exclude .pytest_cache loop/ "$DEST/loop/"
+rsync -a --exclude .git --exclude .deps --exclude .venv --exclude experiments \
+  --exclude __pycache__ --exclude .pytest_cache ./ "$DEST/loop/"
 CHECKPOINT=00000003-xxxxxxxx
-python loop/loop.py fork --run "$RUN" --checkpoint "$CHECKPOINT" \
+python loop.py fork --run "$RUN" --checkpoint "$CHECKPOINT" \
   --new-run "$DEST/loop/experiments/branch-001"
 # --candidate "$CANDIDATE" may replace --checkpoint "$CHECKPOINT".
-cd "$DEST"
+cd "$DEST/loop"
 RUN=branch-001
-uv venv --python 3.10.19 --managed-python --seed loop/.venv
-source loop/.venv/bin/activate
+uv venv --python 3.10.19 --managed-python --seed .venv
+source .venv/bin/activate
 python -m pip install pyyaml==6.0.3
-python loop/bootstrap.py
+python bootstrap.py
 ```
 
 The destination must not already contain `branch-001`. Bootstrap can run in the
@@ -337,13 +342,13 @@ simultaneous clusters share the host's physical resources.
 
 ```sh
 RUN=branch-001
-RUN_DIR="$PWD/loop/experiments/$RUN"
+RUN_DIR="$PWD/experiments/$RUN"
 CLUSTER="$RUN_DIR/deployment/cluster.yaml"
-python loop/loop.py prepare --run "$RUN"
+python loop.py prepare --run "$RUN"
 chia up "$CLUSTER" -y
 JOB="$RUN-$(date +%s)"
 chia job submit --chia-cluster "$CLUSTER" --submission-id "$JOB" --no-wait -- \
-  python -u "$PWD/loop/loop.py" resume --run "$RUN"
+  python -u "$PWD/loop.py" resume --run "$RUN"
 chia job logs --chia-cluster "$CLUSTER" "$JOB" --follow
 ```
 
@@ -474,7 +479,7 @@ search state. It makes no generation call and does not change the population:
 # With this run's native cluster up, and no other writer for this same run:
 JOB="$RUN-replay-$(date +%s)"
 chia job submit --chia-cluster "$CLUSTER" --submission-id "$JOB" --no-wait -- \
-  python -u "$PWD/loop/loop.py" replay --run "$RUN" --candidate "$CANDIDATE"
+  python -u "$PWD/loop.py" replay --run "$RUN" --candidate "$CANDIDATE"
 chia job logs --chia-cluster "$CLUSTER" "$JOB" --follow
 ```
 
@@ -487,8 +492,8 @@ the current matching checkpoint format; there are no old-format migrations.
 
 ```sh
 python -m pip install pytest==9.1.1
-python -m pytest -c loop/pytest.ini loop/tests -q
-CHIA_LIVE_AGENTS=1 python -m pytest -c loop/pytest.ini loop/tests/test_native_cluster.py -q
+python -m pytest -c pytest.ini tests -q
+CHIA_LIVE_AGENTS=1 python -m pytest -c pytest.ini tests/test_native_cluster.py -q
 ```
 
 See [INTEGRATION.md](INTEGRATION.md) for ownership, checkpoint contents, restore
