@@ -15,7 +15,7 @@ from chia_dma.runtime import Runtime, render
 from native_fixture import native_ssh
 
 
-def chia(cfg, action, path):
+def chia(configuration, action, path):
     """Tests invoke the upstream CLI, just as the documented procedure does."""
     result = subprocess.run(
         [sys.executable, "-m", "chia.cli.main", action, str(path), "-y"],
@@ -25,8 +25,8 @@ def chia(cfg, action, path):
     assert result.returncode == 0, result.stderr[-5000:] + result.stdout[-3000:]
 
 
-def cluster(cfg, base, name, *, pools=False):
-    cfg = copy.deepcopy(cfg)
+def cluster(configuration, base, name, *, pools=False):
+    configuration = copy.deepcopy(configuration)
     run = base / (name + "-" + base.name[-8:])
     run.mkdir()
     seed = run / "seed"
@@ -36,15 +36,15 @@ def cluster(cfg, base, name, *, pools=False):
         p.write_text("FROZEN")
     (seed / "tree/frozen").write_text("preserved source")
     if not pools:
-        node = cfg["cluster"]["available_node_types"]["generation"]
-        cfg["cluster"]["available_node_types"] = {"generation": node}
-    path = render(cfg, run, seed)
-    return cfg, run, seed, path
+        node = configuration["cluster"]["available_node_types"]["generation"]
+        configuration["cluster"]["available_node_types"] = {"generation": node}
+    path = render(configuration, run, seed)
+    return configuration, run, seed, path
 
 
-def attach(cfg):
+def attach(configuration):
     ray.init(
-        address=cfg["runtime"]["ray_address"],
+        address=configuration["runtime"]["ray_address"],
         namespace="native-proof",
     )
 
@@ -111,14 +111,14 @@ assert not Path('/opt/loop/experiments').exists()
         time.sleep(delay)
         assert (Path("/workspace") / ALLOWLIST[0]).read_text() == mark + " edited"
         assert (Path("/workspace") / ALLOWLIST[1]).read_text() == mark
-        from chia_dma.state import complete
-        from chia_dma.artifacts import source_bundle
+        from chia_dma.experiment import save_proposal
+        from chia_dma.experiment import read_accelerator_files
 
         assert not Path(sql.db_path).exists()
-        complete(
+        save_proposal(
             sql,
             mark,
-            source_bundle("/workspace"),
+            read_accelerator_files("/workspace"),
             {"response": "BashTool boundary proof"},
             remote=True,
         )
@@ -135,35 +135,37 @@ assert not Path('/opt/loop/experiments').exists()
 def test_native_generation_parent_separation_forbidden_writes_and_serial_reuse(
     native_ssh,
 ):
-    cfg, base = native_ssh
-    cfg = copy.deepcopy(cfg)
+    configuration, base = native_ssh
+    configuration = copy.deepcopy(configuration)
     credentials = base / "empty-credentials"
     credentials.mkdir()
-    cfg["agent"]["backends"][cfg["agent"]["backend"]]["credentials"] = str(credentials)
-    cfg["agent"]["backends"][cfg["agent"]["backend"]]["mounts"] = []
-    cfg, run, seed, path = cluster(cfg, base, "boundaries")
+    configuration["agent"]["backends"][configuration["agent"]["backend"]][
+        "credentials"
+    ] = str(credentials)
+    configuration["agent"]["backends"][configuration["agent"]["backend"]]["mounts"] = []
+    configuration, run, seed, path = cluster(configuration, base, "boundaries")
     try:
-        chia(cfg, "up", path)
-        attach(cfg)
-        from chia_dma.state import State
+        chia(configuration, "up", path)
+        attach(configuration)
+        from chia_dma.experiment import Experiment
         from skydiscover.search.base_database import Program
 
-        state = State(cfg, run)
+        experiment = Experiment(configuration, run)
         for mark in ("parent-A", "parent-B", "parent-C"):
-            state.reserve(
+            experiment.save_selection(
                 Program(
                     id=mark,
                     solution=json.dumps({"source": {n: mark for n in ALLOWLIST}}),
                     metadata={"island": 0},
                 ),
                 [],
-                cid=mark,
+                candidate_id=mark,
             )
         ready = Ready.remote()
         results = [
             get(h)
             for h in [
-                boundary_probe.chia_remote(mark, ready, state.sql, 1)
+                boundary_probe.chia_remote(mark, ready, experiment.sql, 1)
                 for mark in ("parent-A", "parent-B", "parent-C")
             ]
         ]
@@ -171,7 +173,10 @@ def test_native_generation_parent_separation_forbidden_writes_and_serial_reuse(
         for mark, result in zip(("parent-A", "parent-B", "parent-C"), results):
             assert "PARENT=" + mark in result["output"]
             assert result["output"].count("DENIED=") == 3
-            assert state.proposal(mark)["source"][ALLOWLIST[0]] == mark + " edited"
+            assert (
+                experiment.load_proposal(mark)["source"][ALLOWLIST[0]]
+                == mark + " edited"
+            )
         for a, b in [(results[i], results[j]) for i in range(3) for j in range(i)]:
             if a["node"] == b["node"]:
                 assert a["started"] >= b["ended"] or b["started"] >= a["ended"]
@@ -183,26 +188,29 @@ def test_native_generation_parent_separation_forbidden_writes_and_serial_reuse(
                 (results[1], results[2]),
             ]
         )
-        from chia_dma.adapter import generate
+
+        from chia_dma.agent import generate
 
         # A completed proposal returns before even reading the missing parent
         # field; reaching the agent path would fail this task.
-        recovered = get(generate.chia_remote(cfg, state.sql, {"id": "parent-A"}))
-        assert recovered["source"] == state.proposal("parent-A")["source"]
-        state.close()
+        recovered = get(
+            generate.chia_remote(configuration, experiment.sql, {"id": "parent-A"})
+        )
+        assert recovered["source"] == experiment.load_proposal("parent-A")["source"]
+        experiment.close()
         assert all(
             (seed / "tree" / n).read_text() == "FROZEN"
             for n in (*ALLOWLIST, "build.sbt", "software/benchmark.c")
         )
     finally:
         ray.shutdown()
-        chia(cfg, "down", path)
+        chia(configuration, "down", path)
 
 
 @ChiaFunction(resources={"verilator_run": 1}, max_retries=0)
-def simulation_probe(mark):
+def simulation_probe(configuration, mark):
     from chia.chipyard.state_def import BuildArtifact
-    from chia.chipyard.verilator_run_node import VerilatorRunNode
+    from chia_dma.evaluation import simulate
 
     script = (
         "#!/bin/sh\necho BUILD_"
@@ -221,31 +229,34 @@ def simulation_probe(mark):
         "",
         0,
     )
-    result = VerilatorRunNode().run(
-        artifact,
-        ("INPUT_" + mark + "\n").encode(),
-        "same-input.riscv",
-        "/tmp/staging-proof",
-        timeout_seconds=10,
+    configuration["software"]["timeout_seconds"] = 10
+    result = simulate(
+        configuration, artifact, ("INPUT_" + mark + "\n").encode(), "same-input", {}
     )
     assert result.success
     return result.log
 
 
 def test_native_build_simulation_worker_placement(native_ssh):
-    cfg, base = native_ssh
-    cfg, run, seed, path = cluster(cfg, base, "pools", pools=True)
+    configuration, base = native_ssh
+    configuration, run, seed, path = cluster(configuration, base, "pools", pools=True)
     try:
-        chia(cfg, "up", path)
-        with Runtime(cfg, run):
+        chia(configuration, "up", path)
+        with Runtime(configuration, run):
 
             @ChiaFunction()
             def probe():
                 import importlib
                 import os
+                import shutil
                 from pathlib import Path
 
                 p = Path("/home/ray/dma-build/frozen")
+                if p.exists():
+                    for executable in ("riscv64-unknown-elf-gcc", "sbt", "verilator"):
+                        assert shutil.which(executable).startswith(
+                            "/home/ray/chipyard/"
+                        )
                 return (
                     os.readlink("/proc/self/ns/mnt"),
                     (p.read_text() if p.exists() else None),
@@ -253,7 +264,7 @@ def test_native_build_simulation_worker_placement(native_ssh):
                         name: importlib.import_module(name).__file__
                         for name in (
                             "chia.base.ChiaFunction",
-                            "chia_dma.adapter",
+                            "chia_dma.agent",
                             "skydiscover.config",
                         )
                     },
@@ -272,12 +283,16 @@ def test_native_build_simulation_worker_placement(native_ssh):
                 and build[1] == "preserved source"
                 and simulation[1] is None
             )
-            assert head[2]["chia_dma.adapter"] == str(ROOT / "chia_dma/adapter.py")
+            assert head[0] == os.readlink("/proc/self/ns/mnt")
+            assert all(
+                worker[0] != head[0] for worker in (build, simulation, generation)
+            )
+            assert head[2]["chia_dma.agent"] == str(ROOT / "chia_dma/agent.py")
             assert head[2]["chia.base.ChiaFunction"] == str(
-                Path(cfg["chia"]) / "chia/base/ChiaFunction.py"
+                Path(configuration["chia"]) / "chia/base/ChiaFunction.py"
             )
             for worker in (build, simulation, generation):
-                assert worker[2]["chia_dma.adapter"] == "/opt/loop/chia_dma/adapter.py"
+                assert worker[2]["chia_dma.agent"] == "/opt/loop/chia_dma/agent.py"
                 assert (
                     worker[2]["chia.base.ChiaFunction"]
                     == "/opt/chia/chia/base/ChiaFunction.py"
@@ -287,14 +302,75 @@ def test_native_build_simulation_worker_placement(native_ssh):
                     == "/opt/skydiscover/skydiscover/config.py"
                 )
             assert ray.cluster_resources()["generation"] == 2
-            handles = [simulation_probe.chia_remote(mark) for mark in ("A", "B")]
+            handles = [
+                simulation_probe.chia_remote(configuration, mark) for mark in ("A", "B")
+            ]
             assert [get(h).strip() for h in handles] == [
                 "BUILD_A\nINPUT_A",
                 "BUILD_B\nINPUT_B",
             ]
+        job = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "chia.cli.main",
+                "job",
+                "submit",
+                "--chia-cluster",
+                str(path),
+                "--",
+                "python",
+                "-c",
+                "import sys, chia_dma.agent; "
+                f"assert sys.prefix == {str(ROOT / '.venv')!r}; "
+                "print('HOST_HEAD_JOB_OK')",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert job.returncode == 0, job.stdout + job.stderr
+        assert "HOST_HEAD_JOB_OK" in job.stdout
     finally:
         ray.shutdown()
-        chia(cfg, "down", path)
+        chia(configuration, "down", path)
+
+
+@ChiaFunction(resources={"generation": 1}, max_retries=0)
+def cli_checksum_probe(configuration, source):
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+    from chia.base.tools.BashTool import BashTool
+    from chia_dma.agent import make_agent
+    from chia_dma.experiment import read_accelerator_files
+
+    for name, text in source.items():
+        (Path("/workspace") / name).write_text(text)
+    os.chdir("/workspace")
+    tool = BashTool(
+        "dma_bash",
+        work_dir="/workspace",
+        timeout_seconds=120,
+        task_options={
+            "scheduling_strategy": NodeAffinitySchedulingStrategy(
+                ray.get_runtime_context().get_node_id(), soft=False
+            )
+        },
+    )
+    try:
+        prompt = (
+            "Use dma_bash_run_command to run pwd and sha256sum /workspace/"
+            + ALLOWLIST[0]
+            + ". Report the directory and checksum. Do not edit any files."
+        )
+        result = make_agent(configuration).prompt(prompt, [tool])
+        assert result.success, result.stderr
+        return {
+            "response": result.result,
+            "transcript": result.stream_result,
+            "source": read_accelerator_files("/workspace"),
+        }
+    finally:
+        tool.stop()
 
 
 @pytest.mark.skipif(
@@ -303,28 +379,21 @@ def test_native_build_simulation_worker_placement(native_ssh):
 )
 @pytest.mark.parametrize("backend", ["antigravity", "claude", "codex"])
 def test_cli_backend_uses_native_bash_tool(native_ssh, backend):
-    from chia_dma.adapter import generate
     from chia_dma.config import digest
-    from chia_dma.artifacts import source_bundle, write_json
+    from chia_dma.experiment import write_json
 
     original, base = native_ssh
-    cfg = copy.deepcopy(original)
-    cfg["agent"]["backend"] = backend
-    cfg, run, seed, path = cluster(cfg, base, "cli-" + backend)
+    configuration = copy.deepcopy(original)
+    configuration["agent"]["backend"] = backend
+    configuration, run, seed, path = cluster(configuration, base, "cli-" + backend)
     # New private content cannot be inferred from the checksum request.
     import uuid
 
     source = {n: uuid.uuid4().hex for n in ALLOWLIST}
-    task = {
-        "id": "auth",
-        "auth": True,
-        "parent": {"solution": json.dumps({"source": source})},
-        "island": 0,
-    }
     try:
-        chia(cfg, "up", path)
-        attach(cfg)
-        result = get(generate.chia_remote(cfg, None, task))
+        chia(configuration, "up", path)
+        attach(configuration)
+        result = get(cli_checksum_probe.chia_remote(configuration, source))
         write_json(run / "result.json", result)
         assert digest(source[ALLOWLIST[0]].encode()) in result["response"]
         assert result["source"] == source
@@ -332,4 +401,4 @@ def test_cli_backend_uses_native_bash_tool(native_ssh, backend):
             assert "dma_bash" in result["transcript"]
     finally:
         ray.shutdown()
-        chia(cfg, "down", path)
+        chia(configuration, "down", path)

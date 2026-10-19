@@ -2,36 +2,40 @@
 
 from pathlib import Path
 from string import Template
-import json
 import os
-import uuid
 import ray
 import yaml
 from chia.base.ChiaFunction import get
 from chia.base.bypass import Bypass
 from chia.base.cache import get_active_cache, start_cache, stop_cache
 from chia.trace.profiler import start_collector, stop_collector
-from .config import ROOT, ALLOWLIST, digest, frozen
-from .artifacts import git, read_json, snapshot, source_bundle, write_json
-from .tasks import software
+from .config import ROOT, digest, frozen
+from .experiment import (
+    git,
+    read_json,
+    preserve_source,
+    read_accelerator_files,
+    write_json,
+)
+from .evaluation import build_benchmarks
 
 
-def prepare(cfg, run):
+def prepare(configuration, run):
     run.mkdir(parents=True, exist_ok=True)
     if (run / "run.json").exists():
         meta = read_json(run / "run.json")
-        if meta["frozen_hash"] != digest(frozen(cfg)):
+        if meta["frozen_hash"] != digest(frozen(configuration)):
             raise ValueError("Frozen evaluation/search configuration changed")
     else:
         meta = {
             "run_id": run.name,
-            "seed": str(snapshot(cfg)),
-            "frozen_hash": digest(frozen(cfg)),
+            "seed": str(preserve_source(configuration)),
+            "frozen_hash": digest(frozen(configuration)),
             "loop_revision": git(ROOT, "rev-parse", "HEAD"),
             "loop_dirty": bool(git(ROOT, "status", "--porcelain", "--", ".")),
         }
         write_json(run / "run.json", meta)
-    render(cfg, run, meta["seed"])
+    render(configuration, run, meta["seed"])
     return meta
 
 
@@ -45,15 +49,16 @@ def expand(value, bindings):
     return value
 
 
-def render(cfg, run, seed):
+def render(configuration, run, seed):
     """Only expand run paths and separate native generation-worker file binds."""
-    backend = cfg["agent"]["backends"][cfg["agent"]["backend"]]
-    values = dict(
+    agent = configuration["agent"]
+    backend = agent["backends"][agent["backend"]]
+    bindings = dict(
         LOOP=str(ROOT),
         RUN=str(run),
         SEED=str(seed),
-        CHIA=cfg["chia"],
-        SKY=cfg["skydiscover"],
+        CHIA=configuration["chia"],
+        SKY=configuration["skydiscover"],
         NAME=Path(run).name,
         UID=str(os.getuid()),
         GID=str(os.getgid()),
@@ -61,27 +66,27 @@ def render(cfg, run, seed):
         CREDENTIALS=backend["credentials"],
         CREDENTIAL_TARGET=backend["credential_target"],
     )
-    values["HEAD"] = expand(cfg["cluster"]["docker"]["container_name"], values)
-    values["PYTHON_VOLUME"] = values["HEAD"] + "-python"
-    data = expand(cfg["cluster"], values)
-    template = data["available_node_types"].pop("generation")
-    for index in range(template["num_workers"]):
-        work = Path(run) / "work" / f"generation-{index}"
-        work.mkdir(parents=True, exist_ok=True)
-        for name, text in source_bundle(Path(seed) / "tree").items():
-            path = work / Path(name).name
+    deployment = expand(configuration["cluster"], bindings)
+    generation_template = deployment["available_node_types"].pop("generation")
+    for worker_index in range(generation_template["num_workers"]):
+        workspace = Path(run) / "work" / f"generation-{worker_index}"
+        workspace.mkdir(parents=True, exist_ok=True)
+        for name, text in read_accelerator_files(Path(seed) / "tree").items():
+            path = workspace / Path(name).name
             if not path.exists():
                 path.write_text(text)
-        node = expand(template, {"INDEX": str(index), "WORK": str(work)})
-        node["num_workers"] = 1
-        node["docker"]["run_options"] += expand(backend.get("mounts", []), values)
-        node["worker_setup_commands"] += expand(
-            backend.get("setup_commands", []), values
+        worker = expand(
+            generation_template, {"INDEX": str(worker_index), "WORK": str(workspace)}
         )
-        data["available_node_types"][f"generation-{index}"] = node
+        worker["num_workers"] = 1
+        worker["docker"]["run_options"] += expand(backend.get("mounts", []), bindings)
+        worker["worker_setup_commands"] += expand(
+            backend.get("setup_commands", []), bindings
+        )
+        deployment["available_node_types"][f"generation-{worker_index}"] = worker
     path = Path(run) / "deployment/cluster.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    path.write_text(yaml.safe_dump(deployment, sort_keys=False))
     return path
 
 
@@ -99,31 +104,23 @@ def from_cache(tag, data_path, *args, **kwargs):
 class Runtime:
     """Attach to an existing native cluster; own cache/profiling, not worker lifecycle."""
 
-    def __init__(self, cfg, run):
-        self.cfg, self.run = cfg, Path(run)
+    def __init__(self, configuration, run):
+        self.configuration, self.run = configuration, Path(run)
 
     def __enter__(self):
-        cfg = self.cfg
+        configuration = self.configuration
         ray.init(
-            address=cfg["runtime"]["ray_address"],
+            address=configuration["runtime"]["ray_address"],
             namespace="dma-" + digest(str(self.run))[:24],
         )
-        missing = {
-            "generation",
-            "chipyard",
-            "verilator_run",
-        } - ray.cluster_resources().keys()
-        if missing:
-            ray.shutdown()
-            raise ValueError("Missing native CHIA resources: " + str(sorted(missing)))
         start_collector(log_dir=str(self.run / "artifacts/profile"))
         start_cache(
-            cfg["runtime"]["cache_gb"],
+            configuration["runtime"]["cache_gb"],
             str(self.run / "cache"),
             units="GB",
-            yaml_path=cfg["_config_file"],
+            yaml_path=configuration["_config_file"],
         )
-        bypass = Bypass(cfg["_config_file"])
+        bypass = Bypass(configuration["_config_file"])
         for name in ("build", "simulate"):
             bypass.set_cond(name, cache_hit)
             bypass.set_provider(name, from_cache)
@@ -137,31 +134,12 @@ class Runtime:
             ray.shutdown()
 
 
-def authenticate(cfg, state, seed):
-    from .adapter import generate
-
-    source = source_bundle(Path(seed) / "tree")
-    task = {
-        "id": "auth-" + uuid.uuid4().hex,
-        "auth": True,
-        "parent": {"solution": json.dumps({"source": source})},
-        "island": 0,
-        "sequence": 0,
-    }
-    result = get(generate.chia_remote(cfg, state.sql, task))
-    if (
-        digest(source[ALLOWLIST[0]].encode()) not in result["response"]
-        or "/workspace" not in result["response"]
-    ):
-        raise RuntimeError("CLI authentication/BashTool check failed")
-
-
-def prepare_software(cfg, run, seed):
+def prepare_benchmarks(configuration, run, seed):
     path = run / "software/manifest.json"
     manifest = (
         read_json(path)
         if path.exists()
-        else get(software.chia_remote(cfg, str(run), str(seed)))
+        else get(build_benchmarks.chia_remote(configuration, str(run), str(seed)))
     )
     for row in manifest["workloads"].values():
         if digest((run / "software" / row["file"]).read_bytes()) != row["sha256"]:

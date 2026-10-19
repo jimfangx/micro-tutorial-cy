@@ -1,73 +1,47 @@
 # Native CHIA cluster layout plus the tutorial search controls.
 # Fixed mounts, credentials, and evaluation policy are in backend.yaml.
 # prepare expands run paths and worker indices; CPUS is the host CPU count.
-
-# Run-specific native cluster name; NAME is the experiment directory name.
 cluster_name: dma-${NAME}
 provider:
-  # Head host; this tutorial runs all pools on the same system.
   head_ip: 127.0.0.1
 auth:
-  # Existing SSH login and key used by native chia up/down.
   ssh_user: ${USER}
   ssh_private_key: ${HOME}/.ssh/id_ed25519
 
-# Published controller image; loop/container.sh starts this container.
-docker:
-  image: ghcr.io/ucb-bar/chia@sha256:8196c9c1f2790989f06383f2455c888cd7472bd6237cbb7256a080d4c5977b11
-  container_name: dma-${NAME}-head
-
 available_node_types:
   build:
-    # One build at a time per private checkout.
     resources: {chipyard: 1}
-    # Build containers; each builds one candidate at a time using all host CPUs.
     num_workers: 1
     compatible_ips: [127.0.0.1]
     docker:
-      # Pinned upstream worker image.
       image: ghcr.io/ucb-bar/chia-chisel-build@sha256:9eca4dffdce51835005d5971864306d84fe46cc2dd2feb440521b98a14d84300
-      # CHIA appends its native worker index to this prefix.
       container_name: dma-${NAME}-build
   simulation:
-    # Independent single-core benchmark tasks; fill all available CPUs.
     resources:
       verilator_run: ${CPUS}
-    # Simulation containers; each allows one benchmark task per host CPU.
     num_workers: 1
     compatible_ips: [127.0.0.1]
     docker:
-      # Pinned upstream worker image.
       image: ghcr.io/ucb-bar/chia-verilator-run@sha256:188e6ce07df32b8acaefede77fd4691e44da889a318527bf9eff047bb4c655c1
-      # CHIA appends its native worker index to this prefix.
       container_name: dma-${NAME}-simulation
   generation:
-    # One generation at a time per isolated workspace.
     resources: {generation: 1}
-    # Concurrent isolated generation workspaces, one generation per container.
     num_workers: 2
     compatible_ips: [127.0.0.1]
     docker:
-      # Selected provider image from agent.backends below.
       image: ${AGENT_IMAGE}
-      # CHIA appends its native worker index to this prefix.
       container_name: dma-${NAME}-generation-${INDEX}
 
-# Native head startup; address/dashboard ports must be free and consistent.
 head_start_ray_commands:
-- docker exec ${HEAD} /home/ray/anaconda3/bin/ray start --head --node-ip-address=127.0.0.1 --port=6387 --num-cpus=4 --dashboard-host=127.0.0.1
+- ray start --head --node-ip-address=127.0.0.1 --port=6387 --num-cpus=4 --dashboard-host=127.0.0.1
   --dashboard-port=8287 --temp-dir=/tmp/ray/dma-${NAME}
-# Native worker startup using the per-pool CHIA_CPUS environment.
 worker_start_ray_commands:
 - /home/ray/anaconda3/bin/ray start --address=$RAY_HEAD_IP:6387 --num-cpus=$CHIA_CPUS --dashboard-agent-listen-port=0
 
 runtime:
-  # Match the head/worker port above; use separate ports for a second live cluster.
   ray_address: 127.0.0.1:6387
 agent:
-  # antigravity, codex, or claude; redeploy workers after switching.
   backend: antigravity
-  # Pinned generation images selected by agent.backend.
   backends:
     antigravity:
       image: ghcr.io/ucb-bar/chia-antigravity@sha256:e4a1dfdcc9fea188667178311d47a2da7ac8dd150877f74748fce24b39329a0f
@@ -76,7 +50,5 @@ agent:
     claude:
       image: ghcr.io/ucb-bar/chia-claude-code@sha256:00e0817ddf405d0d6a79100ba81b76fa06050a6b84a0950cae534a83a54b74fe
 search:
-  # Total proposals across the experiment and resumes.
   iterations: 2
-  # Maximum concurrent candidate iterations; usually match generation workers.
   max_in_flight: 2

@@ -1,355 +1,198 @@
 # Fixed tutorial implementation settings; edit config.yaml for normal use.
 # ${CPUS} is resolved to the host CPU affinity count when loading.
-# Local Chipyard input tree; copied once with relevant uncommitted files.
-source: ..
-# Experiment/seed directory, relative to this configuration.
+# Chipyard checkout shipped in the pinned build image; base/chipyard.patch adds DMA/Embench.
+base:
+  chipyard_revision: 4ab72313087580a44d647b52923389a06ec0712f
+  embench_revision: 09c2ed8c3b7008c95d08b038de4a3f6dc103ed70
+
 storage: ./experiments
-# Pinned CHIA checkout installed by bootstrap.py.
+
 chia: ./.deps/chia
-# SkyDiscover package inside the evolve-flows submodule.
+
 skydiscover: ./.deps/evolve-flows/skydiscover
-# Pinned evolve-flows checkout used to provide SkyDiscover.
+
 evolve_flows: ./.deps/evolve-flows
-# Repositories and exact revisions installed by bootstrap.py.
+
 dependencies:
-  # Upstream evolve-flows repository to clone.
   evolve_flows_url: https://github.com/ucb-bar/evolve-flows.git
-  # Exact evolve-flows commit, including its SkyDiscover gitlink.
   evolve_flows_revision: 62d271304d4675c21b946e327bf542a1f62c1012
-  # Upstream CHIA Python package source, prepared inside the controller.
   chia_url: https://github.com/ucb-bar/chia.git
-  # Exact CHIA Python integration installed inside the controller; no patches.
   chia_revision: a4cedf24b131c459d7f176453d8e0cea97dda796
-  # Additional controller packages; installation stays inside its container.
-  python_packages: [openai==3.35.1, pydantic==2.12.4, pytest==9.1.1, black==26.10.1]
-# CHIA connection and service limits; worker deployment is below.
+  python_packages: [openai==3.35.1, pydantic==2.12.4, numpy==1.26.4, python-dotenv==1.2.1, tqdm==4.67.1]
+
 runtime:
-  # Build/run collection deadline per phase, in seconds.
   task_timeout_seconds: 14400
-  # CHIA task-output cache capacity, in GB.
   cache_gb: 4
-# CLI generation settings; model/backend may change between resumes.
+
 agent:
-  # Provider model override; null uses the CHIA wrapper default.
   model: null
-  # Wall-clock timeout for one CLI call, in seconds.
   timeout_seconds: 600
-  # Maximum CLI attempts made by the native CHIA wrapper.
   retries: 1
-  # Run a real BashTool/checksum probe before new LLM work.
-  authenticate_before_run: true
-  # Provider-specific images, private credentials, and native CLI options.
   backends:
-    # Google Antigravity worker and optional private-copy overrides.
     antigravity:
-      # Host login directory to copy read-only into the worker private home.
       credentials: ${HOME}/.gemini
-      # Private credential-copy path inside the generation container.
       credential_target: /tmp/agent-home/.gemini
-      # Optional project override; null preserves the copied Antigravity setting.
-      gcp_project: null
-      # Optional location override; null preserves the copied Antigravity setting.
-      gcp_location: null
-      # Keyword arguments passed to this native CHIA CLI model class.
       options:
-        # Additional CLI arguments, one token per list item.
         extra_cli_args:
         - --effort
         - low
-      # Provider-specific native Docker options; keep credential mounts read-only.
       mounts: []
-    # Claude Code worker; its native tools are disabled in favor of BashTool.
     claude:
-      # Host login directory to copy read-only into the worker private home.
       credentials: ${HOME}/.claude
-      # Private credential-copy path inside the generation container.
       credential_target: /tmp/agent-home/.claude
-      # Keyword arguments passed to this native CHIA CLI model class.
       options:
-        # Claude transcript lookup override; null uses the private working directory.
         projects_cwd: null
-        # Additional CLI arguments, one token per list item.
         extra_cli_args:
         - --tools
         - ''
         - --strict-mcp-config
-      # Provider-specific native Docker options; keep credential mounts read-only.
       mounts:
       - --mount 'type=bind,src=${HOME}/.claude.json,dst=/credential-config,readonly'
-      # Provider setup commands run in the container private home.
       setup_commands:
       - cp /credential-config /tmp/agent-home/.claude.json
-    # Codex installed inside the upstream Claude image, which supplies Node/npm.
     codex:
-      # Host login directory to copy read-only into the worker private home.
       credentials: ${HOME}/.codex
-      # Private credential-copy path inside the generation container.
       credential_target: /tmp/agent-home/.codex
-      # Keyword arguments passed to this native CHIA CLI model class.
       options: {}
-      # Install the CLI in private container scratch; no host executable mounts.
       setup_commands:
       - npm install --prefix /tmp/codex --cache /tmp/npm-cache @openai/codex@0.163.0
-# Native SkyDiscover openevolve_native settings.
+
 search:
-  # Random seed for native search sampling.
   random_seed: 42
-  # Number of additional programs sampled for generation context.
   inspirations: 3
-  # Number of native search islands; at least two.
   num_islands: 2
-  # Native population capacity, in programs.
   population_size: 40
-  # Native elite archive capacity, in programs.
   archive_size: 100
-  # Measured descriptors used by native MAP-Elites.
   feature_dimensions:
   - source_bytes
   - dma_bytes_per_cycle
-  # Number of bins per native MAP-Elites descriptor.
   feature_bins: 8
-  # Fraction of native sampling allocated to exploration (0–1).
   exploration_ratio: 0.2
-  # Fraction of native sampling allocated to exploitation (0–1).
   exploitation_ratio: 0.7
-  # Probability of choosing native archive elites (0–1).
   elite_selection_ratio: 0.1
-  # Native island generations between migration attempts.
   migration_interval: 2
-  # Fraction of native island programs migrated per event (0–1).
   migration_rate: 0.1
-  # DMA-specific prompts, indexed by selected island.
   island_guidance:
   - Reduce small-copy latency and setup overhead.
   - Increase large-copy throughput and overlap accelerator-local requests.
-  # Search implementation; keep openevolve_native for native checkpoint ownership.
   type: openevolve_native
-# DMA SoC compilation inputs; simulator assertions remain enabled.
+
 hardware:
-  # Chipyard SoC configuration class to elaborate.
   config: DMARocketConfig
-  # Scala package containing the SoC configuration class.
   config_package: chipyard
-  # Fixed writable accelerator paths; expanding this requires a new integration.
   allowlist:
   - generators/chipyard/src/main/scala/dma/DMAController.scala
   - generators/chipyard/src/main/scala/dma/RoCCDMA.scala
-  # Parallel compiler jobs for one simulator build.
   make_jobs: ${CPUS}
-  # Simulator compilation timeout, in seconds.
   build_timeout_seconds: 3600
-  # Extra variables passed to the upstream Chipyard make flow.
   extra_make_args:
-    # Use the upstream image compiler; local Verilator otherwise embeds a host compiler/sysroot path.
     CXX: /home/ray/chipyard/.conda-env/bin/x86_64-conda-linux-gnu-c++
-    # Maximum Java build heap, in GiB.
     JAVA_HEAP_SIZE: 32G
-  # Whether ChiselBuildNode cleans generated build outputs before compilation.
   clean: false
-# Embench inputs and DMA metrics parser, frozen with the seed.
+
 software:
-  # Existing DMA parser path relative to the preserved source tree.
   metrics_parser: software/rocc-dma/scripts/metrics.py
-  # Commands producing frozen benchmark ELFs in the private build checkout.
-  build_commands:
-  - - python
-    - software/rocc-dma/scripts/embench.py
-    - build
-    - --modes
-    - cpu
-    - dma
-  # Directory whose subdirectories name the Embench workloads.
+  build_command: [make, -C, software/rocc-dma, embench]
   benchmark_inventory: tests/embench-iot/src
-  # ELF path pattern relative to the build checkout.
-  embench_elf: software/rocc-dma/build/embench-{mode}/src/{benchmark}/{benchmark}
-  # Frozen DRAMSim configuration directory relative to the seed tree.
+  embench_elf: software/rocc-dma/build/embench/src/{benchmark}/{benchmark}
   dram_ini: generators/testchipip/src/main/resources/dramsim2_ini
-  # Random seed passed to each simulator task.
   random_seed: 42
-  # Simulator plusargs; each task supplies its own ELF loadmem path.
   plusargs:
-    # Request measured simulator cycle counts.
     +cycle-count: ''
-    # Task-overridden ELF load path; the simulator stages each benchmark independently.
     +loadmem: /test.elf
-  # Maximum simulated cycles before the simulator reports timeout.
   timeout_cycles: 1000000000
-  # Wall-clock timeout for each simulator task, in seconds.
   timeout_seconds: 10800
-# DMA-specific validation and geometric-mean score policy.
+
 fitness:
-  # Optional nonnegative weights keyed by Embench DMA workload name.
   workload_weights: {}
-  # Reject changes in measured DMA work relative to the frozen reference.
-  require_activity_match: true
-# Enable CHIA output caching for the listed expensive tasks.
+
 cache:
-  # Cache compiled simulator artifacts through CHIA get callbacks.
   build: true
-  # Enable native simulator task caching/bypass.
   simulate: true
-# Enable native CHIA reuse providers; completed proposals always remain durable in SQL.
+
 bypass:
-  # Reuse completed simulator builds from the native CHIA cache.
   build: true
-  # Enable native simulator task caching/bypass.
   simulate: true
-# Seed-copy exclusions; do not exclude implementation or evaluation inputs.
-preserve:
-  # Directory basenames excluded from the one-time seed copy.
-  exclude_dirs:
-  - .git
-  - loop
-  - loop_context
-  - .conda-env
-  - .venv
-  - __pycache__
-  - .pytest_cache
-  - target
-  - .classpath_cache
-  - .sbt
-  - .ivy2
-  - .coursier
-  # Source-relative generated/irrelevant paths excluded from the seed copy.
-  exclude_paths:
-  - env.sh
-  - software/rocc-dma/build
-  - sims/verilator/generated-src
-  - sims/verilator/output
-  - sims/firesim/platforms/f1/aws-fpga/SDAccel/examples
-  - software/firemarshal/boards/default/linux
-# Fixed CHIA mounts and setup; images, names, scheduling/startup are in config.yaml.
+
 cluster:
-  # Native CHIA head probes/teardown execute Python inside the controller.
   head_env_commands:
-  - python3() { docker exec -i ${HEAD} /home/ray/anaconda3/bin/python "$@"; }
-  # Native build, simulation, and generation worker templates.
+  - source ${LOOP}/.venv/bin/activate
+  - export PYTHONPATH=${LOOP}
   available_node_types:
-    # Private simulator-build workers; increase container count for parallel builds.
     build:
-      # Environment for setup and Ray tasks, including CPU and private-home settings.
       worker_env_commands:
-      # Image-native tools and container-installed provider binaries.
       - source /home/ray/chipyard/env.sh
-      - export PATH=/home/ray/anaconda3/bin:$PATH
-      # Read-only CHIA/tutorial/SkyDiscover package import paths.
-      - export PYTHONPATH=/opt/dma-python:/opt/loop:/opt/chia:/opt/skydiscover
-      # Ray CPU budget for this worker, in logical CPUs.
+      - export PATH=/home/ray/anaconda3/bin:/home/ray/chipyard/.conda-env/riscv-tools/bin:/home/ray/chipyard/.conda-env/bin:/usr/local/bin:/usr/bin:/bin
+      - export PYTHONPATH=/tmp/dma-python:/opt/loop:/opt/chia:/opt/skydiscover
       - export CHIA_CPUS=${CPUS}
-      # Native setup commands; project writes stay in the private worker checkout.
       worker_setup_commands:
+      - &python_setup python -m pip install --disable-pip-version-check --target /tmp/dma-python openai==3.35.1 pydantic==2.12.4
       - python -m pip install --disable-pip-version-check scons==4.11.1
       - mkdir -p /home/ray/dma-build
       - cp -a ${SEED}/tree/. /home/ray/dma-build/
       - chmod -R u+w /home/ray/dma-build
       - ln -sfnT /home/ray/chipyard/.sbt /home/ray/dma-build/.sbt
       - ln -sfnT /home/ray/chipyard/.ivy2 /home/ray/dma-build/.ivy2
-      # Native Docker worker configuration; CHIA supplies ordinary host networking.
       docker:
-        # Let native chia up fetch the pinned upstream image.
         pull_before_run: true
-        # Native Docker flags and mounts; generation has only two writable project binds.
         run_options:
-        # Container shared-memory capacity, in bytes with Docker size suffix.
         - --shm-size=2g
-        # Per-process soft/hard open-file descriptor limits.
         - --ulimit nofile=65536:65536
-        # Upstream build-image RISC-V toolchain and runtime-library prefix.
         - --env RISCV=/home/ray/chipyard/.conda-env/riscv-tools
-        # Fixed 32 GiB JVM heap, stack size, and private temporary/home directories.
         - --env 'JAVA_TOOL_OPTIONS=-Xmx32G -Xss8M -Djava.io.tmpdir=/tmp
           -Duser.home=/home/ray'
-        # Reuse dependency downloads shipped in the build image.
         - --env COURSIER_CACHE=/home/ray/.cache/coursier/v1
-        # Python packages installed inside the controller's Docker volume.
-        - --mount 'type=volume,src=${PYTHON_VOLUME},dst=/opt/dma-python,readonly'
         - --mount 'type=bind,src=${LOOP}/chia_dma,dst=/opt/loop/chia_dma,readonly'
         - --mount 'type=bind,src=${CHIA},dst=/opt/chia,readonly'
         - --mount 'type=bind,src=${SKY},dst=/opt/skydiscover,readonly'
-        # Trusted evaluator output directory; never mounted writable in generation.
         - --mount 'type=bind,src=${RUN},dst=${RUN}'
         - --mount 'type=bind,src=${SEED},dst=${SEED},readonly'
-        # Maximum image pull time, in seconds (the build image is large).
         pull_timeout: 7200
-    # Simulation worker pool for independent benchmark tasks.
     simulation:
-      # Environment for setup and Ray tasks, including CPU and private-home settings.
       worker_env_commands:
-      # Image-native tools and container-installed provider binaries.
       - export PATH=/home/ray/anaconda3/bin:/usr/local/bin:/usr/bin:/bin
-      # Read-only CHIA/tutorial/SkyDiscover package import paths.
-      - export PYTHONPATH=/opt/dma-python:/opt/loop:/opt/chia:/opt/skydiscover
-      # Ray CPU budget for this worker, in logical CPUs.
+      - export PYTHONPATH=/tmp/dma-python:/opt/loop:/opt/chia:/opt/skydiscover
       - export CHIA_CPUS=${CPUS}
-      # Native Docker worker configuration; CHIA supplies ordinary host networking.
+      worker_setup_commands:
+      - *python_setup
       docker:
-        # Let native chia up fetch the pinned upstream image.
         pull_before_run: true
-        # Native Docker flags and mounts; generation has only two writable project binds.
         run_options:
-        # Container shared-memory capacity, in bytes with Docker size suffix.
         - --shm-size=2g
-        # Per-process soft/hard open-file descriptor limits.
         - --ulimit nofile=65536:65536
-        # Python packages installed inside the controller's Docker volume.
-        - --mount 'type=volume,src=${PYTHON_VOLUME},dst=/opt/dma-python,readonly'
         - --mount 'type=bind,src=${LOOP}/chia_dma,dst=/opt/loop/chia_dma,readonly'
         - --mount 'type=bind,src=${CHIA},dst=/opt/chia,readonly'
         - --mount 'type=bind,src=${SKY},dst=/opt/skydiscover,readonly'
-        # Trusted evaluator output directory; never mounted writable in generation.
         - --mount 'type=bind,src=${RUN},dst=${RUN}'
         - --mount 'type=bind,src=${SEED},dst=${SEED},readonly'
-        # Maximum image pull time, in seconds (the build image is large).
         pull_timeout: 7200
-    # Generation pool here; one slot per worker serializes workspace reuse.
     generation:
-      # Environment for setup and Ray tasks, including CPU and private-home settings.
       worker_env_commands:
-      # Image-native tools and container-installed provider binaries.
       - export PATH=/tmp/codex/node_modules/.bin:/home/ray/.local/bin:/home/ray/anaconda3/bin:/usr/local/bin:/usr/bin:/bin
-      # Read-only CHIA/tutorial/SkyDiscover package import paths.
-      - export PYTHONPATH=/opt/dma-python:/opt/loop:/opt/chia:/opt/skydiscover
-      # Ray CPU budget for this worker, in logical CPUs.
+      - export PYTHONPATH=/tmp/dma-python:/opt/loop:/opt/chia:/opt/skydiscover
       - export CHIA_CPUS=2
-      # Writable private CLI home in tmpfs; image tools remain read-only.
       - export HOME=/tmp/agent-home
-      # Native setup commands; project writes stay in the private worker checkout.
       worker_setup_commands:
+      - *python_setup
       - mkdir -p ${CREDENTIAL_TARGET}
       - rsync -a --exclude conversations --exclude sessions --exclude projects --exclude
         logs --exclude "*.log" --exclude tmp --exclude history.jsonl --exclude shell_snapshots
         --exclude "*.sock" --exclude app-server-control --exclude app-server-daemon
         /credentials/ ${CREDENTIAL_TARGET}/
-      # Native Docker worker configuration; CHIA supplies ordinary host networking.
       docker:
-        # Let native chia up fetch the pinned upstream image.
         pull_before_run: true
-        # Maximum image pull time, in seconds (the build image is large).
         pull_timeout: 7200
-        # Native Docker flags and mounts; generation has only two writable project binds.
         run_options:
-        # Container shared-memory capacity, in bytes with Docker size suffix.
         - --shm-size=256m
-        # Make the generation container root filesystem read-only.
         - --read-only
-        # Drop Linux capabilities from trusted generation processes.
         - --cap-drop=ALL
-        # Prevent privilege gains inside generation workers.
         - --security-opt=no-new-privileges
-        # Private writable temporary storage for Ray, credentials, and CLI scratch files.
         - --tmpfs /tmp:rw,exec,mode=1777
-        # Run generation as the host UID/GID owning its two writable files.
         - --user ${UID}:${GID}
-        # Python packages installed inside the controller's Docker volume.
-        - --mount 'type=volume,src=${PYTHON_VOLUME},dst=/opt/dma-python,readonly'
         - --mount 'type=bind,src=${LOOP}/chia_dma,dst=/opt/loop/chia_dma,readonly'
         - --mount 'type=bind,src=${CHIA},dst=/opt/chia,readonly'
         - --mount 'type=bind,src=${SKY},dst=/opt/skydiscover,readonly'
-        # Preserved project input mounted read-only.
         - --mount 'type=bind,src=${SEED}/tree,dst=/workspace,readonly'
-        # Writable bind for this worker's selected-parent accelerator file.
         - --mount 'type=bind,src=${WORK}/DMAController.scala,dst=/workspace/generators/chipyard/src/main/scala/dma/DMAController.scala'
-        # Writable bind for this worker's selected-parent accelerator file.
         - --mount 'type=bind,src=${WORK}/RoCCDMA.scala,dst=/workspace/generators/chipyard/src/main/scala/dma/RoCCDMA.scala'
-        # Host provider login mounted read-only before copying to the private home.
         - --mount 'type=bind,src=${CREDENTIALS},dst=/credentials,readonly'

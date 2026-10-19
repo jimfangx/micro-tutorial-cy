@@ -5,22 +5,25 @@ The tutorial pins CHIA `a4cedf24`, evolve-flows `62d27130`, and SkyDiscover
 
 | Responsibility | Owner |
 | --- | --- |
+| Ray head, search controller, SQL, cache, profiling | Current host's Python environment |
 | Worker deployment/networking | Native CHIA YAML and `chia up/down` |
 | Search concurrency/iteration processing | SkyDiscover `DiscoveryController` |
 | Sampling, islands, MAP-Elites, migration, population save/load | Native `openevolve_native` |
 | Build and simulation artifacts | CHIA nodes and cache/bypass |
 | Numerical history and pending/completed proposals | CHIA `SQLiteNode` |
-| Fixed base Chipyard/evaluator inputs | One immutable, self-contained source seed |
+| Fixed base Chipyard/evaluator inputs | Pinned build image + bundled patch, materialized as one immutable seed |
 | Materialized accelerator sources | Separate native worker workspaces |
 
 ## Operating the tutorial
 
 [README.md](README.md) contains the runnable procedures:
 
-- [Setup and run](README.md#set-up-and-run): initialize source inputs inside the controller,
-  bootstrap container dependencies, `prepare`, native `chia up`, `doctor`, then `run`.
-- [Stop and resume](README.md#stop-and-resume): interrupt the foreground driver,
-  wait for cleanup, then `chia down` with the original rendered deployment YAML.
+- [Setup and run](README.md#set-up-and-run): bootstrap the host Python environment,
+  `prepare` the bundled baseline inside the build image, native `chia up`,
+  then `chia job submit` with the tutorial entrypoint. Routine commands run on the host.
+- [Stop and resume](README.md#stop-and-resume): use `chia job stop` for the submitted
+  job, then `chia down` with the original rendered deployment YAML. Ctrl-C while
+  following logs only detaches the viewer. Submit a new job ID when resuming.
   `resume --run NAME` reads `latest.json`; increase the YAML proposal total to
   extend the search.
 - [Choose a checkpoint](README.md#find-a-candidate-or-checkpoint): inspect committed
@@ -28,10 +31,10 @@ The tutorial pins CHIA `a4cedf24`, evolve-flows `62d27130`, and SkyDiscover
   `fork --candidate ID --new-run OTHER`. No checkpoint selector lives in YAML.
 - [Restore in a fresh clone](README.md#restore-in-a-fresh-github-clone): obtain
   matching loop code in a loop-only sparse checkout, fork into its experiment
-  directory, retain access to the preserved seed, bootstrap the container packages,
+  directory, retain access to the preserved seed, bootstrap the host Python packages,
   regenerate its deployment, then `chia up` and `resume`. Separate live clusters require distinct run names,
   head/worker ports, dashboard ports, and matching `runtime.ray_address` values.
-- [Inspect logs and metrics](README.md#logs-and-consolidated-metrics): driver log,
+- [Inspect logs and metrics](README.md#logs-and-consolidated-metrics): `chia job logs`,
   raw candidate logs, native CHIA profiling, and read-only consolidated SQL queries.
 
 `run` and `resume` use the same recovery path. There is no special restore action:
@@ -41,35 +44,40 @@ needed for a historical continuation.
 
 ## Images and environment
 
-`config.yaml` pins Linux amd64 upstream CHIA image manifests by digest and shows
-container names. `container.sh` starts the trusted controller from the published
-base image; native `chia up/down` manages build, simulation, and generation
-workers. Native head probes and scoped teardown call Python inside the controller
-through a YAML shell function. No host Python interpreter or toolchain is used.
-The host supplies Bash, Docker, SSH/Docker access, source/state storage, and
-credential files. This configuration is single-host; its binds and named package
-volume are local to that Docker daemon.
+`config.yaml` starts the Ray head directly on the current machine and pins Linux
+amd64 upstream CHIA worker image manifests by digest. Native `chia up/down`
+manages that head and the build, simulation, and generation containers. There is
+no top-level Docker configuration or head-container wrapper. The host supplies
+Python 3.10.19, Git, Bash, Docker, SSH/Docker access, state storage, and credential
+files. This configuration is single-host; bind paths are local to its Docker daemon.
 
-| Container | Tools and integration |
+| Location | Tools and integration |
 | --- | --- |
-| Controller: CHIA base | Image Python 3.10.19/Ray 2.54.0; bootstrap prepares pinned CHIA/evolve-flows/SkyDiscover sources and installs additional Python packages in a Docker volume. Docker/SSH utilities are installed inside the controller. |
-| Build: CHIA chisel-build | Image Java/sbt/Verilator/RISC-V/C++ tools and dependency caches; setup installs pinned SCons inside the container. Ray uses the image's base Python to match the controller. |
+| Host head | `loop/.venv`: Python 3.10.19/Ray 2.54.0, pinned CHIA, and SkyDiscover from the evolve-flows submodule. Bootstrap installs the selected OpenEvolve dependencies, omitting the unused AlphaEvolve backend. |
+| Build: CHIA chisel-build | Image Java/sbt/Verilator/RISC-V/C++ tools and dependency caches; setup installs pinned SCons inside the container. Ray uses the image's base Python 3.10.19 to match the head exactly. |
 | Simulation: CHIA verilator-run | Image Python/Ray, spike-dasm, and runtime support; simulator/shared libraries arrive in the build artifact. |
 | Generation: CHIA Antigravity or Claude Code | Published provider executable; Codex uses the Claude image's Node/npm to install its pinned CLI in private scratch. |
 
-Additional controller packages are mounted read-only into workers. No host venv,
+Missing worker Python packages are installed inside each container's private
+`/tmp/dma-python`; code checkouts are mounted read-only. No host venv,
 Conda tools, agent executable, sbt cache, or JVM is mounted as a dependency.
 Builds use the image's dependency caches and explicit image C++ compiler path.
-There is no derived image, host package installation, job-level import override,
-or upstream patch. Native YAML owns head/worker import environments.
+There is no derived image, host build-tool installation, job-level import
+override, or CHIA package patch. Native YAML activates the host head's venv and
+owns worker import environments. No host agent CLI is invoked.
 
 The tutorial-facing `config.yaml` shows native cluster placement, worker resources
 and counts, Ray startup commands, and provider/search controls. A small recursive
 merge overlays these on the fixed backend settings. Cache/bypass read their fixed settings directly from
 the backend YAML. Host CPU affinity supplies compilation jobs and simulation
 slots automatically; both build heap settings are fixed at 32 GiB.
-Builds use a fresh `/home/ray/dma-build` initialized from the preserved local
-seed, rather than the image's bundled Chipyard checkout. Generation mounts the
+[base/chipyard.patch](base/chipyard.patch) carries DMA hardware/configuration,
+observer, software/parser, and required Embench sources. `base/prepare.sh` runs in
+the pinned build image, copies tracked Chipyard/submodule inputs, and applies the
+patch. The image's Chipyard revision is checked before applying it. Image digest,
+base revisions, and patch/script hashes identify the immutable seed; patch/script
+hashes also enter the frozen experiment contract. No host Chipyard source is read.
+Builds use a fresh `/home/ray/dma-build` initialized from that preserved seed. Generation mounts the
 same seed read-only at `/workspace`, with only its two worker-specific Scala
 files writable. Each generation worker has one serial scheduling slot.
 
@@ -80,7 +88,8 @@ firewall rules, private Ray cluster, or compatibility patches are installed.
 
 ## Search and evaluation
 
-Controller construction is at the top of `search.py`. Its public LLM initializer
+The top-level flow is `run_experiment()` followed by `run_search()` in `loop.py`.
+Controller construction is `create_search_controller()` in that same file. Its public LLM initializer
 provides the CHIA CLI adapter; its evaluator/context-builder hooks supply DMA
 semantics. The database subclass wraps only public sample/add to preserve a
 pending selection and its target island. No controller methods are copied.
@@ -88,10 +97,13 @@ pending selection and its target island. No controller methods are copied.
 It lives in evolve-flows; the same documentation's setup section installs both
 evolve-flows and its SkyDiscover submodule separately. Bootstrap uses that one
 submodule, without a second SkyDiscover checkout. At the pinned revision,
-EvolverNode's YAML-only entrypoint creates its own population/controller and
-does not expose our CLI initializer, preserved population, context-builder, and
+EvolverNode accepts a custom evaluator, but creates its own population/controller
+and does not expose our CLI initializer, preserved population, context-builder, and
 checkpoint callback. The tutorial therefore constructs the full upstream
-DiscoveryController directly. It retains native controller iteration handling
+DiscoveryController directly. `agent.py` contains generation; `evaluation.py`
+keeps the CHIA build call, benchmark fan-out, parsing, scoring, and SQL save in
+execution order. The class no longer wraps the build in a second local build method.
+`experiment.py` holds source preservation and recovery. The refactor retains native controller iteration handling
 and native population save/load; it does not implement another search loop.
 
 The inspected upstream `ChiaEvaluator` uses `ray.get` on build/run handles,
@@ -167,11 +179,11 @@ Paths below are relative to `loop/experiments/NAME/`, except for the shared seed
 | `work/generation-N/` | Transient two-file writable workspace for one serial generation worker. Reinitialized from the chosen parent before each invocation. |
 | `cache/` | CHIA's evictable expensive-task outputs. Not the authoritative proposal or population archive. |
 | `artifacts/ID/build.log` | Collected build stdout/stderr for a candidate. |
-| `artifacts/ID/embench_dma_BENCHMARK.log` | Collected simulator output; seed evaluation also has CPU logs. |
+| `artifacts/ID/BENCHMARK.log` | Collected DMA-mode simulator output. |
 | `artifacts/profile/ChiaProfileCollector.log` | Native CHIA JSONL task profiling; `chia viz-profile ... --format table` aggregates task durations. |
-| `software-build-0.log` | Embench compiler output. |
+| `software-build.log` | Embench compiler output. |
 | `driver.log`, `cluster-up.log` | Optional terminal captures created by the README's `tee` commands. |
-| `../seeds/HASH/manifest.json` and `tree/` | Complete preserved implementation/evaluation source, including relevant uncommitted/untracked files. Shared read-only across forks. |
+| `../seeds/HASH/manifest.json` and `tree/` | Complete image-plus-patch implementation/evaluation source and provenance hashes. Shared read-only across forks. |
 
 The `proposals` table is keyed by candidate `id`. It holds `parent`, `island`,
 `sequence`, `kind` (`seed`, `search`, or `replay`), selected request context, the
@@ -209,20 +221,19 @@ fixed source seed, frozen ELFs, and matching settings. Preserve the following:
 4. The matching loop implementation/configuration and pinned dependencies, plus
    the pinned published images, credentials, Docker, and SSH access.
 
-Restoring an existing run needs no initialized Chipyard source checkout: its
-preserved seed contains the generator, benchmark, parser, and build-source tree.
+Neither starting nor restoring a run needs an initialized host Chipyard checkout.
+An existing run's preserved seed contains the generator, benchmark, parser, and build-source tree.
 The README's sparse clone checks out only `loop/`, then bootstraps the Python
 packages and prepares the restored run. It does not run Chipyard submodule
 initialization, `build-setup.sh`, or `env.sh`. The existing `run.json` must be
-present before `prepare`, otherwise a new seed would be captured from incomplete
-inputs.
+present before `prepare` to restore that run; otherwise `prepare` starts a new
+experiment using the bundled patch and pinned image.
 
-The new clone starts its controller with `container.sh` and bootstraps packages
-inside it. Restored metadata must exist before that controller is created: the
-launcher mounts its referenced seed read-only, including a seed outside the new
-checkout. There is no host `env.sh`, Conda environment, venv, JVM, compiler, or
-agent executable to recreate. The source-only checkout must still contain the
-matching loop implementation and configuration.
+The new clone creates `loop/.venv` with Python 3.10.19 and bootstraps the native head
+packages. Restored metadata must exist before `prepare`; worker mounts then use
+its referenced seed, including a seed outside the new checkout. No host Chipyard
+`env.sh`, Conda toolchain, JVM, compiler, or agent executable is needed. The
+source-only checkout must contain the matching loop implementation/configuration.
 
 `fork` copies the selected native checkpoint and an online SQL backup, retains
 frozen software files, and updates the child run's metadata/latest pointer. It
@@ -234,30 +245,26 @@ The child does not need to retain the source experiment once its state is copied
 but it must retain access to the seed.
 
 On another machine/filesystem, transfer the completed child directory and its
-seed while the child is stopped. Run `rsync -a` inside a published CHIA container
-with source/destination bind mounts to preserve links/modes. Before launching
-the restored controller, update **only the copied run** to the new absolute seed
-path. This standalone container works even when the old seed path is absent:
+seed while the child is stopped. Use `rsync -a` to preserve links/modes. Update
+**only the copied run** to the new absolute seed path, using the host environment:
 
 ```sh
-docker run --rm -i --user "$(id -u):$(id -g)" \
-  --mount "type=bind,src=$NEW_RUN_DIR,dst=/state" \
-  ghcr.io/ucb-bar/chia@sha256:8196c9c1f2790989f06383f2455c888cd7472bd6237cbb7256a080d4c5977b11 \
-  python - "$NEW_SEED" <<'PY_RELOCATE'
+python - "$NEW_RUN_DIR" "$NEW_SEED" <<'PY_RELOCATE'
 import json, pathlib, sys
-path = pathlib.Path('/state/run.json')
+path = pathlib.Path(sys.argv[1]) / 'run.json'
 meta = json.loads(path.read_text())
-meta["seed"] = sys.argv[1]
+meta["seed"] = sys.argv[2]
 path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
 PY_RELOCATE
 ```
 
 Keep the seed contents unchanged and use matching loop/evaluation settings;
 `prepare` is a frozen-settings check and deployment renderer, not an importer or
-an automatic seed manifest audit. Bootstrap dependencies inside the controller,
+an automatic seed manifest audit. Bootstrap the host Python dependencies,
 configure local SSH/provider paths, then follow the README's `prepare`, `chia up`,
-and `resume` procedure. Rendered YAML, controller containers/package volumes,
-and old absolute deployment paths must be recreated.
+and `resume` procedure. Regenerate rendered YAML and absolute deployment paths.
+The previous container-head worker contract requires its matching loop code;
+there is no migration to this host-head setup. Its experiment files remain intact.
 
 Compatibility is deliberately limited:
 
@@ -265,7 +272,7 @@ Compatibility is deliberately limited:
   Use matching loop code, native dependency pins, and evaluation/search rules.
   `run.json` records a Git revision and dirty flag, not an archive of loop code.
   The seed excludes `loop/`; preserve uncommitted loop changes separately.
-- `prepare`/State reject a changed frozen configuration. Fixed hardware/software,
+- `prepare` rejects a changed frozen configuration. Fixed baseline patch/script, hardware/software,
   fitness, native search policy, dependency pins, and build/simulation worker
   image/mount/environment/setup contracts are part of that hash. It is not a
   complete toolchain binary fingerprint.
@@ -286,48 +293,52 @@ Compatibility is deliberately limited:
   repair interruption before admission. Replay uses a new ID/fresh task tags,
   records new metrics, and never adds a population member.
 
-## Evidence
+## Validation
 
-The [container-only suite](experiments/container-only-validation/suite.log)
-passed 18 tests, with three opt-in provider checks skipped. All tests ran inside
-the published controller container. Native checks deployed actual CHIA workers
-and verified head/worker imports, concurrent parent separation, serialized
-workspace reuse, forbidden edits, SQL completion, pool placement, and concurrent
-staging. Controller tests cover invalid-candidate rejection, benchmark fan-out,
-warm/cold cache callbacks, profiling, interruption recovery, admission recovery,
-and full-state online historical fork/replay. These tests use inexpensive tasks
-and recorded observations; they do not establish hardware performance.
+The [host-head suite](experiments/host-head-suite.log) passed 18 checks; three
+authenticated provider calls were skipped. It uses an isolated Python 3.10.19
+environment, independent of Chipyard/Conda. Native CHIA starts the host head and
+Docker workers, then tears them down. Tests verify mount namespaces, head/worker
+imports, concurrent generation and forbidden writes, simulator staging, and a
+`chia job submit` entrypoint using the host venv. Controller tests cover cache,
+profiling, invalid admission, interruption, historical forks/replay, and resume.
+The final [worker check](experiments/host-head-toolchain.log) additionally verifies
+that build tools resolve inside the image after replacing inherited host PATH.
 
-The [image-only build proof](experiments/container-only-validation/build-proof.json)
-compiled all 38 Embench ELFs and a fresh DMARocketConfig simulator from the
-preserved local source. Java, sbt, Verilator, RISC-V/C++ tools, and build caches
-came from the pinned upstream build image. No host toolchain was mounted.
-The build finished successfully in approximately 162 seconds on this host.
+The native-head change removes `container.sh`, its package volume, and the
+corresponding render bindings. Application Python/shell drops from 1,432 to
+1,373 lines; worker dependency setup stays in native YAML.
 
-The [paired Wikisort proof](experiments/container-only-validation/simulation-proof.json)
-ran that freshly built simulator in the pinned upstream runtime image. CPU and
-DMA modes passed the frozen parser, agreed on benchmark/verification outputs,
-and exercised timed DMA offloads. No host tools were mounted. This focused
-check did not run the full Embench simulation suite.
+The [suite](experiments/readability-trim-suite.log) passed 18 checks; the three
+opt-in provider calls were skipped.
+They cover concurrent parent/island contexts, forbidden writes, invalid admission,
+benchmark fan-out, warm/cold cache and profiling, interruption, resume, migration,
+and historical fork/replay. The native worker test exercises the production
+`simulate()` wrapper with inexpensive executable artifacts.
 
-[Live provider checks](experiments/container-only-validation/live-agents.log)
-passed for Antigravity, Claude, and Codex. Each used its container's executable
-and native BashTool to inspect fresh private workspace contents. Codex was
-installed by npm inside the worker; no host agent binaries were mounted.
+[Parser checks](experiments/readability-trim-verification.log) cover failed or
+unverified Embench results, pending DMA transactions, missing acknowledgements,
+and failed copy events. The frozen parser retains these acceptance checks while
+removing CPU comparisons, standalone benchmark modes, and histogram/latency
+bookkeeping checks. Numerical observations are still recorded in SQL.
 
-The [loop-only restore proof](experiments/container-only-validation/source-free-clone/loop/experiments/container-restore-check/restore-proof.json)
-bootstrapped a fresh sparse clone and restored native population, admission,
-SQL proposal sources, and an external preserved seed. The clone contained no
-generator tree or host Conda environment. This was a checkpoint fixture using
-recorded metrics; it did not invoke generation or repeat evaluation.
-Sixteen documented shell blocks passed Bash syntax checks; checkpoint listing,
-consolidated SQL queries, and local documentation links were also checked.
-After recreating the restored controller, [both native worker tests](experiments/container-only-validation/restored-native-workers.log)
-passed again. An interactive launcher probe verified that Ctrl-C reaches Python
-inside the container and exits with SIGINT status.
+[Fresh build evidence](experiments/readability-trim-live/proof.json) records a
+simulator and 19 DMA-only Embench ELFs built in the upstream CHIA image. No host
+Chipyard source/toolchain was mounted. The old Python Embench build/run script
+has been replaced by one Makefile target calling the benchmark's own SCons build.
+The build completed in 126 seconds. The shortened parser also accepted a
+[previously recorded real DMA Wikisort run](experiments/readability-trim-final-bundle.json).
+That check also confirms the final bundle’s 55 other patched inputs match the
+fresh build; only the parser’s required-field check changed afterward.
+No full Embench simulation campaign is part of this refactor validation.
 
-Earlier experiments and validation evidence remain under `experiments/`.
-The container-only contract changes frozen worker/toolchain settings: earlier
-host-toolchain runs require their original loop/configuration. There is no
-silent migration. Current-format container-only checkpoints retain the documented
-SQL/source/native-population recovery guarantees.
+Earlier experiment logs, checkpoints, and build/simulation artifacts remain under
+`experiments/`. They require their matching loop implementation and source
+contract. The DMA-only software manifest uses plain benchmark names such as
+`wikisort`; it does not import older CPU/DMA manifests or checkpoint formats.
+
+[Size accounting](experiments/readability-trim-size.json) records 335 fewer
+Python/shell lines: the main application goes from 1,526 to 1,432 lines, and
+bundled Python goes from 490 to 249. `config.yaml` goes from 82 to 58 lines;
+`backend.yaml` goes from 331 to 196. The application still has eight Python files;
+no additional runtime framework or compatibility layer was introduced.

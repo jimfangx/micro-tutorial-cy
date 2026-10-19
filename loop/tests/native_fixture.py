@@ -50,27 +50,30 @@ LogLevel ERROR
                     break
             except OSError:
                 time.sleep(0.05)
-        cfg = load()
-        cfg["cluster"]["docker"]["container_name"] = os.environ["CHIA_CONTROLLER"]
+        configuration = load()
+        for worker in configuration["cluster"]["available_node_types"].values():
+            worker.setdefault("worker_setup_commands", []).append(
+                "python -m pip install --target /tmp/dma-python pytest==9.1.1"
+            )
         with socket.socket() as ray_socket, socket.socket() as dashboard_socket:
             ray_socket.bind(("127.0.0.1", 0))
             dashboard_socket.bind(("127.0.0.1", 0))
             ray_port = ray_socket.getsockname()[1]
             dashboard_port = dashboard_socket.getsockname()[1]
-        cfg["runtime"]["ray_address"] = f"127.0.0.1:{ray_port}"
+        configuration["runtime"]["ray_address"] = f"127.0.0.1:{ray_port}"
         for key in ("head_start_ray_commands", "worker_start_ray_commands"):
-            cfg["cluster"][key] = [
+            configuration["cluster"][key] = [
                 command.replace("6387", str(ray_port)).replace(
                     "8287", str(dashboard_port)
                 )
-                for command in cfg["cluster"][key]
+                for command in configuration["cluster"][key]
             ]
-        cfg["cluster"]["auth"] = {
+        configuration["cluster"]["auth"] = {
             "ssh_user": pwd.getpwuid(os.getuid()).pw_name,
             "ssh_private_key": str(folder / "client"),
             "ssh_proxy_command": f"nc 127.0.0.1 {port}",
         }
-        yield cfg, folder
+        yield configuration, folder
     finally:
         proc.terminate()
         proc.wait(timeout=10)
