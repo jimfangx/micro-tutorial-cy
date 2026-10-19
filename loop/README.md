@@ -36,8 +36,9 @@ full historical search state, including the population and islands.
 
 The current machine runs the Ray head, search controller, SQLite, and cache.
 Generation, compilation, and simulation run in Docker workers. Run commands on
-the host, from the directory containing `loop/`, with `loop/.venv` activated. A sparse clone
-containing only `loop/` supports both new runs and checkpoint restores. Replace
+the host, from the directory containing `loop/`, with `loop/.venv` activated.
+A copied `loop/` folder or a sparse clone supports both new runs and checkpoint
+restores. The copied folder needs no Git repository or commits. Replace
 example run, candidate, checkpoint, and destination names with your own.
 
 ## Set up and run
@@ -45,21 +46,62 @@ example run, candidate, checkpoint, and destination names with your own.
 This section creates a new experiment without a host Chipyard checkout. For an
 existing checkpoint, see [restore in a fresh clone](#restore-in-a-fresh-github-clone).
 
-The host needs Python **3.10.19**, Git, Bash, Docker, and passwordless SSH to the
-configured host. Docker must work without sudo for that SSH user. No host
-Chipyard, Java, sbt, Verilator, RISC-V compiler, or agent CLI is needed.
-The example is single-host: source/state bind mounts must be available to its
-Docker daemon. Authenticate your selected provider using its container
-CLI and retain its login files at the credential paths in `backend.yaml`.
+Use a Linux x86-64 host. The Ubuntu commands below install host utilities and
+start SSH; install [Docker Engine](https://docs.docker.com/engine/install/ubuntu/)
+if it is not already available. No host Chipyard, Java, sbt, Verilator, RISC-V
+compiler, Conda environment, or agent CLI is needed.
 
-Create the host head's Python environment once. Bootstrap installs pinned CHIA
-and SkyDiscover from evolve-flows; it installs the OpenEvolve dependencies and
-omits SkyDiscover's optional AlphaEvolve backend. Workers use published CHIA
+```sh
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl git openssh-server rsync
+sudo systemctl enable --now ssh
+```
+
+Docker must work without sudo for your user and its SSH sessions. After installing
+Docker, use its [group setup](https://docs.docker.com/engine/install/linux-postinstall/)
+if needed:
+
+```sh
+sudo usermod -aG docker "$USER"
+```
+
+Log out and back in after changing groups, then continue below. The example is
+single-host; all source/state bind paths must be available to that Docker daemon.
+
+Native CHIA connects to this machine through SSH. If you have not configured
+local key authentication, run this once; it retains an existing default key:
+
+```sh
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+if [ ! -f "$HOME/.ssh/id_ed25519" ]; then
+  ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
+fi
+cat "$HOME/.ssh/id_ed25519.pub" >> "$HOME/.ssh/authorized_keys"
+chmod 600 "$HOME/.ssh/authorized_keys"
+```
+
+`config.yaml` defaults to this key and `$USER`. If an existing key needs a
+passphrase, load it into your SSH agent before `chia up`. Authenticate your
+selected LLM provider using its container CLI and retain its login files at the
+credential paths in `backend.yaml`.
+
+From the directory containing the copied `loop/`, create the host head's Python
+environment once. Keep `loop/base/` and both YAML files. Start without copied
+`.venv/` or `.deps/` directories: their installed paths belong to the old location.
+Git is needed to download dependencies, but your loop itself needs no Git metadata.
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/); it downloads
+the exact Python interpreter, so no preinstalled Python is required. Bootstrap
+installs pinned CHIA, SkyDiscover from evolve-flows, and the OpenEvolve dependencies.
+It omits SkyDiscover's optional AlphaEvolve backend. Workers use published CHIA
 images and install missing packages inside their own containers. No derived image
 or head container is created:
 
 ```sh
-python3.10 -m venv loop/.venv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv venv --python 3.10.19 --managed-python --seed loop/.venv
 source loop/.venv/bin/activate
 python -m pip install pyyaml==6.0.3
 python loop/bootstrap.py
@@ -80,9 +122,6 @@ The host head uses Python 3.10.19 and Ray 2.54.0, matching the workers exactly;
 Ray rejects even a Python patch-version mismatch. Native YAML activates `loop/.venv` and
 supplies worker import paths. Build tools come from the build image's own
 Chipyard environment; the host environment is never mounted into workers.
-
-If that Python version is unavailable locally, use
-`uv venv --python 3.10.19 --seed loop/.venv` instead of `python3.10 -m venv`.
 
 Choose `agent.backend: antigravity`, `codex`, or `claude` in `config.yaml`.
 `search.iterations` is the **total** number of search proposals across all
@@ -235,6 +274,7 @@ source cluster remains up, as described next.
 Check out only `loop/`; the saved seed supplies generator/benchmark/parser inputs,
 and published CHIA images supply build/runtime tools. The host still needs the
 Python head environment, Docker, SSH/Docker access, and provider credentials.
+Complete the host setup above first when restoring on a new machine.
 
 A GitHub clone supplies code, not experiment state. Keep the matching loop code,
 selected checkpoint, SQL, frozen ELFs, and the entire seed referenced by `run.json`.
@@ -265,7 +305,7 @@ python loop/loop.py fork --run "$RUN" --checkpoint "$CHECKPOINT" \
 # --candidate "$CANDIDATE" may replace --checkpoint "$CHECKPOINT".
 cd "$DEST"
 RUN=branch-001
-python3.10 -m venv loop/.venv
+uv venv --python 3.10.19 --managed-python --seed loop/.venv
 source loop/.venv/bin/activate
 python -m pip install pyyaml==6.0.3
 python loop/bootstrap.py

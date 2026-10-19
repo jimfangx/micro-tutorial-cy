@@ -169,7 +169,7 @@ Paths below are relative to `loop/experiments/NAME/`, except for the shared seed
 
 | Path | Contents and use |
 | --- | --- |
-| `run.json` | Absolute preserved-seed path, frozen settings hash, loop Git revision/dirty flag, and fork provenance. |
+| `run.json` | Absolute preserved-seed path, frozen settings hash, optional loop Git revision/dirty flag, and fork provenance. |
 | `metrics.db` | CHIA SQLite proposal/source archive and consolidated numerical history. Keep WAL/SHM companions while a writer is live. |
 | `latest.json` | Name of the latest committed checkpoint, used by resume. |
 | `checkpoints/SEQUENCE-SUFFIX/state.json` | Frozen settings hash, admitted candidate IDs, and generated/evaluated flags for SQL requests at that boundary. |
@@ -270,7 +270,9 @@ Compatibility is deliberately limited:
 
 - No old checkpoint-format migrations or compatibility branches are supported.
   Use matching loop code, native dependency pins, and evaluation/search rules.
-  `run.json` records a Git revision and dirty flag, not an archive of loop code.
+  `run.json` records a Git revision and dirty flag when available, not an archive
+  of loop code. A copied loop needs no repository or commits: revision is null
+  without a commit, and the dirty flag is null outside a repository.
   The seed excludes `loop/`; preserve uncommitted loop changes separately.
 - `prepare` rejects a changed frozen configuration. Fixed baseline patch/script, hardware/software,
   fitness, native search policy, dependency pins, and build/simulation worker
@@ -294,6 +296,13 @@ Compatibility is deliberately limited:
   records new metrics, and never adds a population member.
 
 ## Validation
+
+The [copied-loop checks](experiments/copied-loop-tests.log) passed 11 tests,
+including preparation outside Git, in an empty repository, and with a committed
+revision. A [standalone setup](experiments/copied-loop-setup-proof.json) also
+created a fresh Python 3.10.19 environment, fetched and installed dependencies,
+and ran real Docker source preparation from a copied folder outside any Git
+repository. It recorded null Git provenance and generated native deployment YAML.
 
 The [host-head suite](experiments/host-head-suite.log) passed 18 checks; three
 authenticated provider calls were skipped. It uses an isolated Python 3.10.19

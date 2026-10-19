@@ -425,6 +425,7 @@ def write_json(path, value):
 
 
 def git(root, *args):
-    return subprocess.check_output(["git", "-C", str(root), *args], text=True).rstrip(
-        "\n"
+    result = subprocess.run(
+        ["git", "-C", str(root), *args], capture_output=True, text=True
     )
+    return result.stdout.rstrip("\n") if result.returncode == 0 else None

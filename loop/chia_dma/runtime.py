@@ -27,12 +27,15 @@ def prepare(configuration, run):
         if meta["frozen_hash"] != digest(frozen(configuration)):
             raise ValueError("Frozen evaluation/search configuration changed")
     else:
+        working_tree_status = git(ROOT, "status", "--porcelain", "--", ".")
         meta = {
             "run_id": run.name,
             "seed": str(preserve_source(configuration)),
             "frozen_hash": digest(frozen(configuration)),
             "loop_revision": git(ROOT, "rev-parse", "HEAD"),
-            "loop_dirty": bool(git(ROOT, "status", "--porcelain", "--", ".")),
+            "loop_dirty": (
+                None if working_tree_status is None else bool(working_tree_status)
+            ),
         }
         write_json(run / "run.json", meta)
     render(configuration, run, meta["seed"])
