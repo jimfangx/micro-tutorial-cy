@@ -1,3 +1,5 @@
+# MOVED! SEE https://ucb.bar/chia-tutorial@7e109cdf3e07f76a5ea128914b6298fab793b672
+
 ![CHIPYARD](https://github.com/ucb-bar/chipyard/raw/main/docs/_static/images/chipyard-logo-full.png)
 
 # Chipyard framework
